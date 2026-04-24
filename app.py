@@ -33,6 +33,7 @@ _DEFAULTS: dict = {
     "beat_inputs": {},
     # pipeline outputs
     "s1_char_fields": None,       # dict — LLM-generated character fields
+    "s1_char_id": None,           # DB id assigned after Step 1 save
     "s2_image_path": "",          # character portrait path (selected)
     "s2_image_paths": [],         # list of 2 portrait candidate paths
     "s2_image_prompt": "",        # editable portrait prompt
@@ -45,6 +46,10 @@ _DEFAULTS: dict = {
     "s6_beat_fields": None,       # list — LLM-generated beat dicts
     "s7_storyline": "",           # str — final approved storyline narrative
     "s7_editor_log": [],          # list of {loop, score, improvements} dicts
+    "s7_phase": "idle",           # "idle" | "critiquing" | "reviewing"
+    "s7_current_draft": "",       # storyline draft currently under review
+    "s7_current_critique": {},    # {"score": float, "improvements": [str,...]}
+    "s7_loop_num": 0,             # current loop iteration number
     "s8_script": None,            # dict — video scene script
     "s8_script_prompt": "",       # editable screenplay prompt context
     "s9_segment_paths": [],       # list of .mp4 paths
@@ -55,7 +60,6 @@ _DEFAULTS: dict = {
     **{f"s{n}_status": "pending" for n in range(1, 12)},
     # ui helpers
     "pipeline_started": False,
-    "segment_duration": 5,
     "selected_voice_id": None,
 }
 
@@ -93,7 +97,7 @@ def _clear_from(n: int):
     prompt_keys = {
         2: ["s2_image_prompt", "s2_image_paths"],
         5: ["s5_image_prompt", "s5_scene_image_paths", "s5_poster_fields"],
-        7: ["s7_editor_log"],
+        7: ["s7_editor_log", "s7_phase", "s7_current_draft", "s7_current_critique", "s7_loop_num"],
         8: ["s8_script_prompt"],
         9: ["s9_segment_prompts"],
     }
@@ -104,6 +108,12 @@ def _clear_from(n: int):
             st.session_state[key] = _DEFAULTS[key]
         for pk in prompt_keys.get(i, []):
             st.session_state[pk] = _DEFAULTS[pk]
+
+
+def _show_video(path: str, label: str = "▶ View video"):
+    """Display a video inside a collapsed expander (click to expand/fullscreen)."""
+    with st.expander(label, expanded=False):
+        st.video(path)
 
 
 def prev_done(n: int) -> bool:
@@ -126,13 +136,7 @@ with st.sidebar:
         st.success("All API keys configured ✓")
 
     st.divider()
-    seg_dur = st.selectbox(
-        "Veo3 segment duration",
-        [5, 8],
-        index=0,
-        help="5 s → ~7 segments (~35 s). 8 s → ~5 segments (~40 s).",
-    )
-    st.session_state["segment_duration"] = seg_dur
+    st.info("5 segments × 8 s = 40 s video")
 
     # try:
     #     available_voices = list_voices()
@@ -340,7 +344,7 @@ st.subheader("⚙️ Pipeline")
 char_inputs     = st.session_state["char_inputs"]
 scenario_inputs = st.session_state["scenario_inputs"]
 beat_inputs     = st.session_state["beat_inputs"]
-seg_dur         = st.session_state["segment_duration"]
+seg_dur         = 8   # fixed: 5 segments × 8 s = 40 s
 voice_id        = st.session_state["selected_voice_id"]
 
 
@@ -349,6 +353,9 @@ step_header(1, "Generate Character Fields")
 
 if st.session_state["s1_status"] == "done":
     fields = st.session_state["s1_char_fields"]
+    char_id_saved = st.session_state.get("s1_char_id")
+    if char_id_saved:
+        st.caption(f"Saved to DB — Character ID: `{char_id_saved}`")
     with st.expander("✅ Character fields preview (editable below)", expanded=False):
         col_a, col_b = st.columns(2)
         with col_a:
@@ -386,6 +393,16 @@ else:
                 st.session_state["s1_error"] = str(e)
                 with st.expander("Error details"):
                     st.code(traceback.format_exc())
+        # with st.spinner("Saving character to DB…"):
+        #     try:
+        #         from utils.db_saver import save_character
+        #         char_id = save_character(fields)
+        #         st.session_state["s1_char_id"] = char_id
+        #     except Exception as e:
+        #         st.session_state["s1_status"] = "error"
+        #         st.session_state["s1_error"] = f"DB save failed: {e}"
+        #         with st.expander("Error details"):
+        #             st.code(traceback.format_exc())
         st.rerun()
 
 
@@ -394,7 +411,23 @@ st.divider()
 step_header(2, "Generate Character Portrait")
 
 if st.session_state["s2_status"] == "done":
-    st.image(st.session_state["s2_image_path"], width=380)
+    paths_done = st.session_state.get("s2_image_paths", [])
+    if len(paths_done) >= 2:
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            st.caption("Portrait A")
+            st.image(paths_done[0], width=180)
+            with st.popover("🔍 Full size"):
+                st.image(paths_done[0], use_container_width=True)
+        with col_p2:
+            st.caption("Portrait B")
+            st.image(paths_done[1], width=180)
+            with st.popover("🔍 Full size"):
+                st.image(paths_done[1], use_container_width=True)
+    else:
+        st.image(st.session_state["s2_image_path"], width=180)
+        with st.popover("🔍 Full size"):
+            st.image(st.session_state["s2_image_path"], use_container_width=True)
     with st.expander("Portrait prompt used", expanded=False):
         st.caption(st.session_state.get("s2_image_prompt", ""))
     if st.button("Regenerate Portrait", key="regen_s2"):
@@ -432,6 +465,8 @@ else:
                         try:
                             paths = generate_images(st.session_state["s2_image_prompt"], count=2)
                             st.session_state["s2_image_paths"] = paths
+                            st.session_state["s2_image_path"]  = paths[0]
+                            st.session_state["s2_status"]      = "done"
                         except Exception as e:
                             st.session_state["s2_status"] = "error"
                             st.session_state["s2_error"] = str(e)
@@ -442,26 +477,6 @@ else:
                 if st.button("↺ Re-prepare Prompt", key="reprep_s2"):
                     st.session_state["s2_image_prompt"] = ""
                     st.rerun()
-        else:
-            # Phase 3: show both portraits side-by-side, user picks one
-            st.caption("Pick the portrait you want to use:")
-            col_a, col_b = st.columns(2)
-            paths = st.session_state["s2_image_paths"]
-            with col_a:
-                st.image(paths[0], use_container_width=True)
-                if st.button("Select Portrait A", key="pick_s2_a", type="primary"):
-                    st.session_state["s2_image_path"] = paths[0]
-                    st.session_state["s2_status"] = "done"
-                    st.rerun()
-            with col_b:
-                st.image(paths[1], use_container_width=True)
-                if st.button("Select Portrait B", key="pick_s2_b", type="primary"):
-                    st.session_state["s2_image_path"] = paths[1]
-                    st.session_state["s2_status"] = "done"
-                    st.rerun()
-            if st.button("↺ Regenerate Both", key="regen_s2_both"):
-                st.session_state["s2_image_paths"] = []
-                st.rerun()
     else:
         st.caption("Complete Step 1 first.")
 
@@ -559,7 +574,9 @@ st.divider()
 step_header(5, "Generate Scenario Poster Image")
 
 if st.session_state["s5_status"] == "done":
-    st.image(st.session_state["s5_scene_image_path"], width=600)
+    st.image(st.session_state["s5_scene_image_path"], width=280)
+    with st.popover("🔍 Full size"):
+        st.image(st.session_state["s5_scene_image_path"], use_container_width=True)
     with st.expander("Poster prompt used", expanded=False):
         st.caption(st.session_state.get("s5_image_prompt", ""))
     if st.button("Regenerate Poster", key="regen_s5"):
@@ -682,13 +699,17 @@ else:
             col_a, col_b = st.columns(2)
             paths = st.session_state["s5_scene_image_paths"]
             with col_a:
-                st.image(paths[0], use_container_width=True)
+                st.image(paths[0], width=200)
+                with st.popover("🔍 Full size A"):
+                    st.image(paths[0], use_container_width=True)
                 if st.button("Select Poster A", key="pick_s5_a", type="primary"):
                     st.session_state["s5_scene_image_path"] = paths[0]
                     st.session_state["s5_status"] = "done"
                     st.rerun()
             with col_b:
-                st.image(paths[1], use_container_width=True)
+                st.image(paths[1], width=200)
+                with st.popover("🔍 Full size B"):
+                    st.image(paths[1], use_container_width=True)
                 if st.button("Select Poster B", key="pick_s5_b", type="primary"):
                     st.session_state["s5_scene_image_path"] = paths[1]
                     st.session_state["s5_status"] = "done"
@@ -757,10 +778,9 @@ _MAX_EDITOR_LOOPS = 3
 _SCORE_THRESHOLD  = 6.5
 
 if st.session_state["s7_status"] == "done":
-    storyline = st.session_state["s7_storyline"]
+    storyline  = st.session_state["s7_storyline"]
     editor_log = st.session_state.get("s7_editor_log", [])
 
-    # Show editor loop history
     if editor_log:
         with st.expander(f"Editor loop history ({len(editor_log)} iteration(s))", expanded=False):
             for entry in editor_log:
@@ -769,7 +789,6 @@ if st.session_state["s7_status"] == "done":
                     for pt in entry["improvements"]:
                         st.caption(f"• {pt}")
 
-    # Editable storyline — user can tweak before passing to Step 8
     st.session_state["s7_storyline"] = st.text_area(
         "Storyline narrative (edit if desired before generating screenplay in Step 8)",
         value=storyline,
@@ -786,45 +805,125 @@ elif st.session_state["s7_status"] == "error":
 
 else:
     if prev_done(7):
-        if st.button("📖 Generate Storyline", key="run_s7", type="primary"):
-            ch = st.session_state["s1_char_fields"]
-            sc = st.session_state["s4_scenario_fields"]
-            bf = st.session_state["s6_beat_fields"]
-            editor_log = []
+        ch = st.session_state["s1_char_fields"]
+        sc = st.session_state["s4_scenario_fields"]
+        bf = st.session_state["s6_beat_fields"]
+        phase = st.session_state["s7_phase"]
+
+        # ── Phase: idle — show start button ──────────────────────────────
+        if phase == "idle":
+            if st.button("📖 Generate Storyline", key="run_s7", type="primary"):
+                with st.spinner("Writer agent drafting storyline…"):
+                    try:
+                        draft = generate_storyline(ch, sc, bf)
+                        st.session_state["s7_current_draft"] = draft
+                        st.session_state["s7_loop_num"]      = 1
+                        st.session_state["s7_phase"]         = "critiquing"
+                    except Exception as e:
+                        st.session_state["s7_status"] = "error"
+                        st.session_state["s7_error"]  = str(e)
+                        with st.expander("Error details"):
+                            st.code(traceback.format_exc())
+                st.rerun()
+
+        # ── Phase: critiquing — run editor, then move to reviewing ────────
+        elif phase == "critiquing":
+            loop_num = st.session_state["s7_loop_num"]
+            st.info(f"Editor agent reviewing storyline (iteration {loop_num}/{_MAX_EDITOR_LOOPS})…")
             try:
-                progress_ph = st.empty()
-                progress_ph.info("Writer agent drafting storyline…")
-                storyline = generate_storyline(ch, sc, bf)
-
-                for loop in range(_MAX_EDITOR_LOOPS):
-                    progress_ph.info(f"Editor agent reviewing storyline (loop {loop + 1}/{_MAX_EDITOR_LOOPS})…")
-                    critique = critique_storyline(storyline, ch, sc, bf)
-                    editor_log.append({
-                        "loop": loop + 1,
-                        "score": critique["score"],
-                        "improvements": critique.get("improvements", []),
-                    })
-                    if critique["score"] >= _SCORE_THRESHOLD:
-                        progress_ph.success(f"Storyline approved by editor (score {critique['score']}/10)")
-                        break
-                    progress_ph.info(
-                        f"Score {critique['score']}/10 — rewriting with editor notes (loop {loop + 1})…"
-                    )
-                    storyline = generate_storyline(ch, sc, bf, editor_notes=critique["improvements"])
-                else:
-                    progress_ph.warning(
-                        f"Max editor loops reached — using best version (score {editor_log[-1]['score']}/10)"
-                    )
-
-                st.session_state["s7_storyline"]   = storyline
-                st.session_state["s7_editor_log"]  = editor_log
-                st.session_state["s7_status"]      = "done"
+                critique = critique_storyline(
+                    st.session_state["s7_current_draft"], ch, sc, bf
+                )
+                st.session_state["s7_current_critique"] = critique
+                st.session_state["s7_phase"]            = "reviewing"
             except Exception as e:
                 st.session_state["s7_status"] = "error"
                 st.session_state["s7_error"]  = str(e)
                 with st.expander("Error details"):
                     st.code(traceback.format_exc())
             st.rerun()
+
+        # ── Phase: reviewing — show draft + editable critique ────────────
+        elif phase == "reviewing":
+            loop_num = st.session_state["s7_loop_num"]
+            critique = st.session_state["s7_current_critique"]
+            score    = critique.get("score", 0)
+            improvements = list(critique.get("improvements", []))
+
+            st.markdown(f"**Iteration {loop_num}** — Editor score: `{score:.1f}/10`")
+
+            # Current draft (read-only preview)
+            st.text_area(
+                "Current storyline draft",
+                value=st.session_state["s7_current_draft"],
+                height=300,
+                disabled=True,
+                key="s7_draft_preview",
+            )
+
+            # Editable critique points
+            if improvements:
+                st.markdown("**Critique points** _(edit before regenerating)_:")
+                edited_improvements = []
+                for idx, pt in enumerate(improvements):
+                    edited = st.text_input(
+                        f"Point {idx + 1}",
+                        value=pt,
+                        key=f"s7_critique_pt_{loop_num}_{idx}",
+                    )
+                    edited_improvements.append(edited)
+            else:
+                edited_improvements = []
+                st.success("No specific improvements flagged by editor.")
+
+            col_accept, col_regen = st.columns([1, 1])
+            with col_accept:
+                if st.button("✅ Accept Storyline", key="s7_accept", type="primary"):
+                    log = st.session_state.get("s7_editor_log", [])
+                    log.append({
+                        "loop": loop_num,
+                        "score": score,
+                        "improvements": improvements,
+                    })
+                    st.session_state["s7_storyline"]        = st.session_state["s7_current_draft"]
+                    st.session_state["s7_editor_log"]       = log
+                    st.session_state["s7_status"]           = "done"
+                    st.session_state["s7_phase"]            = "idle"
+                    st.session_state["s7_current_draft"]    = ""
+                    st.session_state["s7_current_critique"] = {}
+                    st.rerun()
+
+            # Show Regenerate button only when score is low and loops remain
+            can_regen = score < _SCORE_THRESHOLD and loop_num < _MAX_EDITOR_LOOPS
+            with col_regen:
+                regen_label = (
+                    "🔄 Regenerate with Edits"
+                    if can_regen
+                    else f"🔄 Regenerate (loop {loop_num}/{_MAX_EDITOR_LOOPS})"
+                )
+                if st.button(regen_label, key="s7_regen", disabled=(loop_num >= _MAX_EDITOR_LOOPS and not can_regen)):
+                    log = st.session_state.get("s7_editor_log", [])
+                    log.append({
+                        "loop": loop_num,
+                        "score": score,
+                        "improvements": improvements,
+                    })
+                    st.session_state["s7_editor_log"] = log
+                    with st.spinner(f"Writer agent rewriting (iteration {loop_num + 1})…"):
+                        try:
+                            new_draft = generate_storyline(
+                                ch, sc, bf,
+                                editor_notes=edited_improvements if edited_improvements else improvements,
+                            )
+                            st.session_state["s7_current_draft"] = new_draft
+                            st.session_state["s7_loop_num"]      = loop_num + 1
+                            st.session_state["s7_phase"]         = "critiquing"
+                        except Exception as e:
+                            st.session_state["s7_status"] = "error"
+                            st.session_state["s7_error"]  = str(e)
+                            with st.expander("Error details"):
+                                st.code(traceback.format_exc())
+                    st.rerun()
     else:
         st.caption("Complete Step 6 first.")
 
@@ -857,11 +956,9 @@ else:
         if st.button("📜 Generate Video Screenplay", key="run_s8", type="primary"):
             sc = st.session_state["s4_scenario_fields"]
             ch = st.session_state["s1_char_fields"]
-            target = 35
-            num_segs = max(4, round(target / seg_dur))
             with st.spinner("Writing roleplay teaser screenplay…"):
                 try:
-                    script = generate_video_scene_script(sc, ch, num_segs, seg_dur)
+                    script = generate_video_scene_script(sc, ch, num_segments=5, segment_duration=8)
                     st.session_state["s8_script"] = script
                     st.session_state["s8_status"] = "done"
                 except Exception as e:
@@ -885,7 +982,10 @@ def _build_segment_prompt(seg: dict) -> str:
     parts = [seg.get("scene_description", "").strip(), seg.get("shot_description", "").strip()]
     dialogue = seg.get("dialogue", "").strip()
     if dialogue:
-        parts.append(f'The character speaks: "{dialogue}"')
+        parts.append(
+            f'The character speaks directly to camera: "{dialogue}" '
+            "She maintains direct eye contact with the camera lens throughout, as if talking to the viewer."
+        )
     cont = seg.get("continuation_note", "").strip()
     if cont:
         parts.append(cont)
@@ -958,7 +1058,7 @@ def _run_step9():
             segment_paths.append(video_path)
             st.session_state["s9_segment_paths"] = segment_paths
             status_text.success(f"Segment {n}/{total} done in {seg_elapsed}s")
-            st.video(video_path)
+            _show_video(video_path, label=f"▶ Segment {n}/{total}")
 
             if n < total:
                 current_ref = extract_last_frame(video_path)
@@ -979,8 +1079,7 @@ def _run_step9():
 
 if st.session_state["s9_status"] == "done":
     for idx, vp in enumerate(st.session_state["s9_segment_paths"], 1):
-        st.caption(f"Segment {idx}")
-        st.video(vp)
+        _show_video(vp, label=f"▶ Segment {idx}")
     if st.button("Regenerate All Segments", key="regen_s9"):
         _clear_from(9); st.rerun()
 
@@ -989,7 +1088,7 @@ elif st.session_state["s9_status"] == "error":
     if done:
         st.warning(f"{len(done)} segment(s) completed. Resume will continue from segment {len(done)+1}.")
         for idx, vp in enumerate(done, 1):
-            st.caption(f"Segment {idx} (done)"); st.video(vp)
+            _show_video(vp, label=f"▶ Segment {idx} (done)")
     st.error(st.session_state.get("s9_error", "Unknown error"))
     col_ra, col_rb = st.columns(2)
     with col_ra:
@@ -1034,7 +1133,7 @@ st.divider()
 step_header(10, "Concatenate Video Segments")
 
 if st.session_state["s10_status"] == "done":
-    st.video(st.session_state["s10_combined_path"])
+    _show_video(st.session_state["s10_combined_path"], label="▶ Combined video")
     if st.button("Regenerate Concat", key="regen_s10"):
         _clear_from(10); st.rerun()
 
@@ -1065,7 +1164,7 @@ st.divider()
 step_header(11, "Final Video")
 
 if st.session_state["s11_status"] == "done":
-    st.video(st.session_state["s11_final_path"])
+    _show_video(st.session_state["s11_final_path"], label="▶ Final video")
     if st.button("Reset Final", key="regen_s11"):
         _clear_from(11); st.rerun()
 
@@ -1105,7 +1204,7 @@ all_media_done = (
 if not all_media_done:
     st.info("Complete at least Steps 1–6 to enable saving.")
 else:
-    if st.button("💾 Save Character, Scenario & Beats to DB", type="primary"):
+    if st.button("💾 Save Scenario & Beats to DB", type="primary"):
         from utils.supabase_client import upload_image, upload_audio, upload_video
         from utils.db_saver import save_character, save_scenario, save_beats
 
@@ -1113,9 +1212,11 @@ else:
             try:
                 progress = st.empty()
 
-                # 1. Upload character portrait
-                progress.info("Uploading character portrait…")
-                char_image_url = upload_image(st.session_state["s2_image_path"], prefix="characters/images")
+                # 1. Upload both character portrait candidates & update character record
+                progress.info("Uploading character portraits…")
+                portrait_urls = []
+                for _portrait_path in st.session_state.get("s2_image_paths") or [st.session_state["s2_image_path"]]:
+                    portrait_urls.append(upload_image(_portrait_path, prefix="characters/images"))
 
                 # 2. Upload character voice
                 char_audio_url = None
@@ -1123,11 +1224,12 @@ else:
                     progress.info("Uploading character voice…")
                     char_audio_url = upload_audio(st.session_state["s3_audio_path"], prefix="characters/audio")
 
-                # 3. Save character to DB
-                progress.info("Saving character to DB…")
+                # 3. Upsert character with media URLs (text fields already saved in Step 1)
+                progress.info("Updating character media in DB…")
                 char_data = {
                     **st.session_state["s1_char_fields"],
-                    "imageUrl": char_image_url,
+                    "id": st.session_state.get("s1_char_id"),
+                    "imageUrl": portrait_urls,
                     "voiceAudioUrl": char_audio_url,
                 }
                 char_id = save_character(char_data)

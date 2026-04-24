@@ -1,6 +1,12 @@
-enerator client {
+generator client {
   provider = "prisma-client-js"
   output   = "../src/generated/prisma"
+}
+
+generator py {
+  provider             = "prisma-client-py"
+  interface            = "asyncio"
+  recursive_type_depth = 5
 }
 
 datasource db {
@@ -302,8 +308,7 @@ model Character {
   // Injected into the guardrails section of the assembled system prompt.
 
   avatarPrompt   String?
-  avatarImage    String?
-  imageUrl       String?
+  imageUrl       String[]  @default([])
   voiceAudioUrl  String?   // Supabase URL — ElevenLabs character voice
   accentHsl      String?   @db.VarChar(50)
 

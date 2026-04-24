@@ -23,40 +23,58 @@ def _run_async(coro):
         return asyncio.run(coro)
 
 
+def _trunc(value, max_len: int) -> str:
+    """Truncate a string to max_len characters."""
+    s = str(value) if value is not None else ""
+    return s[:max_len]
+
+
 async def _save_character_async(data: dict) -> str:
     from prisma import Prisma
     db = Prisma()
     await db.connect()
     try:
         # Character.id is @id @db.VarChar(10) — must be provided by caller or generated
-        char_id = data.get("id") or _short_id()
+        char_id = _trunc(data.get("id") or _short_id(), 10)
         record = await db.character.upsert(
             where={"id": char_id},
             data={
                 "create": {
                     "id": char_id,
-                    "name": data.get("name", ""),
+                    "name": _trunc(data.get("name", ""), 100),
                     "age": int(data.get("age", 22)),
                     "gender": data.get("gender", "FEMALE"),
-                    "city": data.get("city", ""),
-                    "archetype": data.get("archetype", ""),
+                    "city": _trunc(data.get("city", ""), 100),
+                    "archetype": _trunc(data.get("archetype", ""), 255),
                     "vibeSummary": data.get("vibeSummary", ""),
                     "backstory": data.get("backstory", ""),
                     "speakingStyle": data.get("speakingStyle", ""),
-                    "emojiUsage": data.get("emojiUsage", ""),
-                    "textingSpeed": data.get("textingSpeed", ""),
+                    "emojiUsage": _trunc(data.get("emojiUsage", ""), 150),
+                    "textingSpeed": _trunc(data.get("textingSpeed", ""), 150),
                     "voicePrompt": data.get("voicePrompt", ""),
                     "hardLimits": data.get("hardLimits", []),
                     "avatarPrompt": data.get("avatarPrompt", ""),
-                    "accentHsl": data.get("accentHsl", ""),
-                    "imageUrl": data.get("imageUrl"),
+                    "accentHsl": _trunc(data.get("accentHsl", ""), 50),
+                    "imageUrl": data.get("imageUrl") or [],
                     "voiceAudioUrl": data.get("voiceAudioUrl"),
                 },
                 "update": {
-                    "imageUrl": data.get("imageUrl"),
-                    "voiceAudioUrl": data.get("voiceAudioUrl"),
-                    "accentHsl": data.get("accentHsl", ""),
+                    "name": _trunc(data.get("name", ""), 100),
+                    "age": int(data.get("age", 22)),
+                    "gender": data.get("gender", "FEMALE"),
+                    "city": _trunc(data.get("city", ""), 100),
+                    "archetype": _trunc(data.get("archetype", ""), 255),
+                    "vibeSummary": data.get("vibeSummary", ""),
+                    "backstory": data.get("backstory", ""),
+                    "speakingStyle": data.get("speakingStyle", ""),
+                    "emojiUsage": _trunc(data.get("emojiUsage", ""), 150),
+                    "textingSpeed": _trunc(data.get("textingSpeed", ""), 150),
+                    "voicePrompt": data.get("voicePrompt", ""),
+                    "hardLimits": data.get("hardLimits", []),
                     "avatarPrompt": data.get("avatarPrompt", ""),
+                    "accentHsl": _trunc(data.get("accentHsl", ""), 50),
+                    "imageUrl": data.get("imageUrl") or [],
+                    "voiceAudioUrl": data.get("voiceAudioUrl"),
                 },
             },
         )

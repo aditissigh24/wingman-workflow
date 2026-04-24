@@ -317,7 +317,9 @@ Output ONLY the JSON object. No explanation, no preamble."""
             response_mime_type="application/json",
         ),
     )
-    return _parse_json_response(response.text)
+    result = _parse_json_response(response.text)
+    result["city"] = c3  # city comes from user input, not LLM
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -568,6 +570,7 @@ Rules:
 - scene_description: ONLY the environment. No character actions.
 - shot_description: ONLY observable physical motion + camera framing.
 - dialogue: 1st person, spoken TO the viewer. Convey the emotional texture and stakes of the roleplay — not the plot. ~{int(segment_duration * 2.5)} words per segment.
+- CAMERA EYE CONTACT: Whenever the character is speaking dialogue, she must look directly into the camera lens — not off to the side, not into the distance. She holds steady eye contact with the camera as if speaking to the person watching. Reflect this in the shot_description for any segment with dialogue (e.g. "she looks directly into the camera lens").
 - Vary camera framing across segments (wide → medium → close-up → pull back).
 - The dialogue arc should move from establishing the vibe → surfacing the tension → leaving the viewer wanting to know what happens next.
 - CRITICAL — NO REAL PEOPLE: Do NOT mention any real celebrity, public figure, actor, politician, athlete, influencer, brand, or trademarked name anywhere in scene_description, shot_description, dialogue, or continuation_note. Use only fictional or generic references (e.g. "a popular song", "a Bollywood-style film" — never a specific artist or title). Veo3 will hard-reject the video if any real person's name or likeness appears in the prompt.

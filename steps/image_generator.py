@@ -18,7 +18,7 @@ def generate_image(enhanced_prompt: str) -> str:
         contents=enhanced_prompt,
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE"],
-            image_config=types.ImageConfig(aspect_ratio="16:9"),
+            image_config=types.ImageConfig(aspect_ratio="9:16"),
         ),
     )
 
@@ -50,3 +50,11 @@ def generate_image(enhanced_prompt: str) -> str:
         "Gemini returned a response but with no image data inside it. "
         "The prompt may have been blocked by content safety filters. Try rephrasing your prompt."
     )
+
+
+def generate_images(enhanced_prompt: str, count: int = 2) -> list[str]:
+    """
+    Generate `count` images from the same prompt.
+    Returns a list of file paths to the saved images.
+    """
+    return [generate_image(enhanced_prompt) for _ in range(count)]

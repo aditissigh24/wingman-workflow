@@ -8,3 +8,4 @@ mutagen>=1.47.0
 imageio-ffmpeg>=0.4.9
 supabase>=2.0.0
 prisma>=0.13.0
+anthropic>=0.97.0

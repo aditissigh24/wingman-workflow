@@ -1,17 +1,27 @@
+import logging
 import time
 import traceback
 
 import streamlit as st
 
-from config import validate_keys, CITY_ACCENT_MAP
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+from config import validate_keys, CITY_ACCENT_MAP, ELEVENLABS_VOICE_ID
 from steps.audio_generator import generate_audio, list_voices
+from steps.elevenlabs_generator import generate_audio_fal
 from steps.image_generator import generate_image, generate_images
+from steps.lipsync_heygen import lipsync_heygen
 from steps.media_merger import concatenate_segments
 from steps.prompt_enhancer import (
     enhance_image_prompt,
     enhance_audio_prompt,
+    generate_audio_script,
     generate_character_fields,
     generate_scenario_fields,
+    generate_beat_sequence,
     generate_beat_fields,
     generate_storyline,
     critique_storyline,
@@ -19,7 +29,7 @@ from steps.prompt_enhancer import (
     generate_poster_fields,
     assemble_poster_prompt,
 )
-from steps.veo3_generator import extract_last_frame, generate_video_segment
+from steps.video_dispatcher import extract_last_frame, generate_video_segment
 
 st.set_page_config(page_title="Wingman Creator", page_icon="🎬", layout="wide")
 st.title("🎬 Wingman — Character & Scenario Creator")
@@ -43,7 +53,8 @@ _DEFAULTS: dict = {
     "s5_scene_image_paths": [],   # list of 2 poster candidate paths
     "s5_image_prompt": "",        # editable poster prompt (assembled from fields)
     "s5_poster_fields": {},       # structured poster input fields
-    "s6_beat_fields": None,       # list — LLM-generated beat dicts
+    "s6_beat_sequence": None,      # dict — LLM-generated beat sequence (first pass)
+    "s6_beat_fields": None,       # list — LLM-generated beat dicts (second pass)
     "s7_storyline": "",           # str — final approved storyline narrative
     "s7_editor_log": [],          # list of {loop, score, improvements} dicts
     "s7_phase": "idle",           # "idle" | "critiquing" | "reviewing"
@@ -52,22 +63,29 @@ _DEFAULTS: dict = {
     "s7_loop_num": 0,             # current loop iteration number
     "s8_script": None,            # dict — video scene script
     "s8_script_prompt": "",       # editable screenplay prompt context
+    "s8b_audio_script": "",       # LLM-generated voiceover script text
+    "s8c_audio_path": "",         # ElevenLabs TTS audio file path
     "s9_segment_paths": [],       # list of .mp4 paths
     "s9_segment_prompts": {},     # dict {segment_number: editable_prompt}
     "s10_combined_path": "",      # concatenated video
-    "s11_final_path": "",         # final video
+    "s10b_final_path": "",        # HeyGen lipsynced final video path
+    "s11_final_path": "",         # confirmed final video
     # step statuses
     **{f"s{n}_status": "pending" for n in range(1, 12)},
+    "s8b_status": "pending",
+    "s8c_status": "pending",
+    "s10b_status": "pending",
     # ui helpers
     "pipeline_started": False,
     "selected_voice_id": None,
+    "manual_voice_id": "",
+    "voices_cache": [],
 }
 
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-BEAT_TYPES = ["HOOK", "BUILD", "TWIST", "CONSEQUENCE", "CLIFFHANGER"]
 CITIES = list(CITY_ACCENT_MAP.keys())
 
 
@@ -86,8 +104,21 @@ def step_header(n: int, title: str):
     st.markdown(f"### Step {n} — {title} &nbsp; {_status_badge(n)}")
 
 
+def _substep_badge(key: str) -> str:
+    s = st.session_state.get(f"s{key}_status", "pending")
+    return {
+        "done":    ":green[✓ Done]",
+        "error":   ":red[✗ Error]",
+        "pending": ":gray[○ Pending]",
+    }.get(s, ":gray[○ Pending]")
+
+
+def step_header_sub(key: str, title: str):
+    st.markdown(f"### Step {key} — {title} &nbsp; {_substep_badge(key)}")
+
+
 def _clear_from(n: int):
-    """Reset outputs and statuses for steps n–11."""
+    """Reset outputs and statuses for steps n–11 (including sub-steps 8b, 8c, 10b)."""
     data_keys = [
         "s1_char_fields", "s2_image_path", "s3_audio_path",
         "s4_scenario_fields", "s5_scene_image_path", "s6_beat_fields",
@@ -97,10 +128,19 @@ def _clear_from(n: int):
     prompt_keys = {
         2: ["s2_image_prompt", "s2_image_paths"],
         5: ["s5_image_prompt", "s5_scene_image_paths", "s5_poster_fields"],
+        6: ["s6_beat_sequence"],
         7: ["s7_editor_log", "s7_phase", "s7_current_draft", "s7_current_critique", "s7_loop_num"],
         8: ["s8_script_prompt"],
         9: ["s9_segment_prompts"],
     }
+    # Sub-step clearing: 8b+8c depend on 8; 10b depends on 8c and 10
+    if n <= 8:
+        for k in ["s8b_status", "s8b_audio_script", "s8c_status", "s8c_audio_path",
+                  "s10b_status", "s10b_final_path"]:
+            st.session_state[k] = _DEFAULTS[k]
+    elif n <= 10:
+        for k in ["s10b_status", "s10b_final_path"]:
+            st.session_state[k] = _DEFAULTS[k]
     for i in range(n, 12):
         st.session_state[f"s{i}_status"] = "pending"
         key = data_keys[i - 1] if i <= len(data_keys) else None
@@ -122,6 +162,9 @@ def prev_done(n: int) -> bool:
     if n == 4:
         # Step 3 is optional — Step 4 only needs Step 2.
         return st.session_state["s2_status"] == "done"
+    if n == 11:
+        # Step 11 requires Step 10b (HeyGen lipsync) to be complete.
+        return st.session_state["s10b_status"] == "done"
     return st.session_state[f"s{n-1}_status"] == "done"
 
 
@@ -239,46 +282,25 @@ with tab_scen:
         placeholder="e.g. From one of 47 strangers to the one she actually wants to talk to",
         value=si.get("arc_destination", ""),
     )
-
-with tab_beats:
-    st.caption("3 inputs → N beats generated (narrative context, flow + hook directives, advance logic…)")
-    bi = st.session_state.get("beat_inputs", {})
-
-    num_beats = st.slider(
-        "B1 — How many beats does this scenario have?",
-        min_value=1, max_value=5, value=bi.get("num_beats", 5),
-        help="1=HOOK only, 5=full arc (HOOK→BUILD→TWIST→CONSEQUENCE→CLIFFHANGER)",
+    st.divider()
+    st.text_input(
+        "Viewer's name (used in character's introduction)",
+        placeholder="e.g. Rahul",
+        key="viewer_name",
+        help="The character will address the viewer by this name in the video intro.",
     )
 
-    st.markdown("**B2 — Select beat type for each slot:**")
-    beat_seq = bi.get("beat_sequence", BEAT_TYPES[:num_beats])
-    # Adjust to num_beats
-    while len(beat_seq) < num_beats:
-        beat_seq.append(BEAT_TYPES[min(len(beat_seq), len(BEAT_TYPES)-1)])
-    beat_seq = beat_seq[:num_beats]
+with tab_beats:
+    st.caption("AI generates the beat sequence and all beat fields — number of beats, turn limits, advance scores. Optional: give it a twist/test moment hint.")
+    bi = st.session_state.get("beat_inputs", {})
 
-    beat_seq_out = []
-    bcols = st.columns(num_beats)
-    for idx, col in enumerate(bcols):
-        with col:
-            default_bt = beat_seq[idx] if idx < len(beat_seq) else BEAT_TYPES[min(idx, len(BEAT_TYPES)-1)]
-            chosen = col.selectbox(
-                f"Beat {idx+1}",
-                BEAT_TYPES,
-                index=BEAT_TYPES.index(default_bt) if default_bt in BEAT_TYPES else 0,
-                key=f"beat_sel_{idx}",
-            )
-            beat_seq_out.append(chosen)
-
-    has_twist = "TWIST" in beat_seq_out
-    b3 = ""
-    if has_twist:
-        b3 = st.text_area(
-            "B3 — What does she do to test him at the TWIST beat? What is she actually checking for?",
-            placeholder="e.g. She brings up Rohit casually. She's checking if he gets uncomfortable or honest.",
-            height=80,
-            value=bi.get("test_moment_desc", ""),
-        )
+    b3 = st.text_area(
+        "B1 — Optional: describe a twist or test moment you want in the story",
+        placeholder="e.g. She brings up Rohit casually. She's checking if he gets uncomfortable or honest.",
+        height=80,
+        value=bi.get("test_moment_desc", ""),
+        help="If left blank, the AI will invent the twist moment itself based on the scenario arc.",
+    )
 
 # ── Start / Reset ────────────────────────────────────────────────────────
 st.divider()
@@ -314,8 +336,7 @@ if start_clicked and not missing_fields:
         "arc_destination": s5.strip(),
     }
     new_beat = {
-        "num_beats": num_beats, "beat_sequence": beat_seq_out,
-        "test_moment_desc": b3.strip() if has_twist else "",
+        "test_moment_desc": b3.strip(),
     }
     changed = (
         new_char != st.session_state["char_inputs"]
@@ -356,22 +377,31 @@ if st.session_state["s1_status"] == "done":
     char_id_saved = st.session_state.get("s1_char_id")
     if char_id_saved:
         st.caption(f"Saved to DB — Character ID: `{char_id_saved}`")
-    with st.expander("✅ Character fields preview (editable below)", expanded=False):
+    with st.expander("✅ Character fields preview ", expanded=False):
         col_a, col_b = st.columns(2)
         with col_a:
             st.markdown(f"**Name:** {fields.get('name','')}")
             st.markdown(f"**Age:** {fields.get('age','')}")
+            st.markdown(f"**Gender:** {fields.get('gender','')}")
             st.markdown(f"**City:** {fields.get('city','')}")
             st.markdown(f"**Archetype:** {fields.get('archetype','')}")
             st.markdown(f"**Accent HSL:** {fields.get('accentHsl','')}")
             st.markdown(f"**Emoji usage:** {fields.get('emojiUsage','')}")
             st.markdown(f"**Texting speed:** {fields.get('textingSpeed','')}")
-        with col_b:
-            st.markdown("**Vibe Summary:**")
-            st.caption(fields.get('vibeSummary',''))
             st.markdown("**Hard Limits:**")
             for hl in fields.get('hardLimits', []):
                 st.caption(f"• {hl}")
+        with col_b:
+            st.markdown("**Vibe Summary:**")
+            st.caption(fields.get('vibeSummary',''))
+            st.markdown("**Backstory:**")
+            st.caption(fields.get('backstory',''))
+            st.markdown("**Speaking Style:**")
+            st.caption(fields.get('speakingStyle',''))
+            st.markdown("**Avatar Prompt:**")
+            st.caption(fields.get('avatarPrompt',''))
+            st.markdown("**Voice Prompt:**")
+            st.caption(fields.get('voicePrompt',''))
     if st.button("Regenerate Character Fields", key="regen_s1"):
         _clear_from(1)
         st.rerun()
@@ -411,23 +441,23 @@ st.divider()
 step_header(2, "Generate Character Portrait")
 
 if st.session_state["s2_status"] == "done":
-    paths_done = st.session_state.get("s2_image_paths", [])
+    paths_done = [p for p in st.session_state.get("s2_image_paths", []) if p is not None]
     if len(paths_done) >= 2:
         col_p1, col_p2 = st.columns(2)
         with col_p1:
             st.caption("Portrait A")
             st.image(paths_done[0], width=180)
             with st.popover("🔍 Full size"):
-                st.image(paths_done[0], use_container_width=True)
+                st.image(paths_done[0], width="stretch")
         with col_p2:
             st.caption("Portrait B")
             st.image(paths_done[1], width=180)
             with st.popover("🔍 Full size"):
-                st.image(paths_done[1], use_container_width=True)
+                st.image(paths_done[1], width="stretch")
     else:
         st.image(st.session_state["s2_image_path"], width=180)
         with st.popover("🔍 Full size"):
-            st.image(st.session_state["s2_image_path"], use_container_width=True)
+            st.image(st.session_state["s2_image_path"], width="stretch")
     with st.expander("Portrait prompt used", expanded=False):
         st.caption(st.session_state.get("s2_image_prompt", ""))
     if st.button("Regenerate Portrait", key="regen_s2"):
@@ -463,7 +493,7 @@ else:
                 if st.button("🖼️ Generate 2 Portraits", key="run_s2", type="primary"):
                     with st.spinner("Generating 2 portrait options…"):
                         try:
-                            paths = generate_images(st.session_state["s2_image_prompt"], count=2)
+                            paths = generate_image(st.session_state["s2_image_prompt"])
                             st.session_state["s2_image_paths"] = paths
                             st.session_state["s2_image_path"]  = paths[0]
                             st.session_state["s2_status"]      = "done"
@@ -537,12 +567,26 @@ if st.session_state["s4_status"] == "done":
             st.markdown(f"**Time of day:** {sf.get('timeOfDay','')}")
             st.markdown(f"**Tagline:** _{sf.get('tagline','')}_")
             st.markdown(f"**Overall arc:** {sf.get('overallArc','')}")
+            st.markdown(f"**Primal hook:** {sf.get('primalHook','')}")
+            st.markdown(f"**Learning objective:** {sf.get('learningObjective','')}")
+            st.markdown(f"**Good outcome:** {sf.get('goodOutcome','')}")
+            st.markdown(f"**Bad outcome:** {sf.get('badOutcome','')}")
         with col_d:
             st.markdown("**Situation setup:**")
             st.caption(sf.get('situationSetupForUser',''))
+            st.markdown("**Atmosphere:**")
+            st.caption(sf.get('atmosphere',''))
+            st.markdown("**Setting description:**")
+            st.caption(sf.get('settingDescription',''))
+            st.markdown("**Image prompt:**")
+            st.caption(sf.get('imagePrompt',''))
             st.markdown("**Initial messages:**")
             for msg in sf.get('initialMessages', []):
                 st.caption(f"→ {msg}")
+            chips = sf.get('initialChips', [])
+            if chips:
+                st.markdown("**Initial chips:**")
+                st.caption(" · ".join(chips))
     if st.button("Regenerate Scenario Fields", key="regen_s4"):
         _clear_from(4); st.rerun()
 
@@ -576,7 +620,7 @@ step_header(5, "Generate Scenario Poster Image")
 if st.session_state["s5_status"] == "done":
     st.image(st.session_state["s5_scene_image_path"], width=280)
     with st.popover("🔍 Full size"):
-        st.image(st.session_state["s5_scene_image_path"], use_container_width=True)
+        st.image(st.session_state["s5_scene_image_path"], width="stretch")
     with st.expander("Poster prompt used", expanded=False):
         st.caption(st.session_state.get("s5_image_prompt", ""))
     if st.button("Regenerate Poster", key="regen_s5"):
@@ -675,7 +719,7 @@ else:
                 if st.button("🎬 Generate 2 Posters", key="run_s5", type="primary"):
                     with st.spinner("Generating 2 poster options…"):
                         try:
-                            paths = generate_images(st.session_state["s5_image_prompt"], count=2)
+                            paths = generate_image(st.session_state["s5_image_prompt"])
                             st.session_state["s5_scene_image_paths"] = paths
                         except Exception as e:
                             st.session_state["s5_status"] = "error"
@@ -698,19 +742,24 @@ else:
             st.caption("Pick the poster you want to use:")
             col_a, col_b = st.columns(2)
             paths = st.session_state["s5_scene_image_paths"]
+            if isinstance(paths, str):
+                paths = [paths]
             with col_a:
                 st.image(paths[0], width=200)
                 with st.popover("🔍 Full size A"):
-                    st.image(paths[0], use_container_width=True)
+                    st.image(paths[0], width="stretch")
                 if st.button("Select Poster A", key="pick_s5_a", type="primary"):
                     st.session_state["s5_scene_image_path"] = paths[0]
                     st.session_state["s5_status"] = "done"
                     st.rerun()
             with col_b:
-                st.image(paths[1], width=200)
+                has_b = len(paths) > 1 and paths[1] is not None
+                if has_b:
+                    st.image(paths[1], width=200)
                 with st.popover("🔍 Full size B"):
-                    st.image(paths[1], use_container_width=True)
-                if st.button("Select Poster B", key="pick_s5_b", type="primary"):
+                    if has_b:
+                        st.image(paths[1], width="stretch")
+                if st.button("Select Poster B", key="pick_s5_b", type="primary", disabled=not has_b):
                     st.session_state["s5_scene_image_path"] = paths[1]
                     st.session_state["s5_status"] = "done"
                     st.rerun()
@@ -721,13 +770,24 @@ else:
         st.caption("Complete Step 4 first.")
 
 
-# ─── STEP 6 — Generate Beat Fields ───────────────────────────────────────
+# ─── STEP 6 — Generate Beat Sequence + Beat Fields ───────────────────────
 st.divider()
-step_header(6, "Generate Beat Fields")
+step_header(6, "Generate Beats")
+
+_s6_seq   = st.session_state.get("s6_beat_sequence")   # first-pass result dict
+_s6_beats = st.session_state.get("s6_beat_fields")     # second-pass result list
 
 if st.session_state["s6_status"] == "done":
     beats = st.session_state["s6_beat_fields"]
-    st.caption(f"{len(beats)} beats generated")
+    seq   = st.session_state["s6_beat_sequence"]
+
+    # Show beat sequence summary
+    seq_labels = " → ".join(seq.get("beat_sequence", []))
+    st.caption(f"Sequence: **{seq_labels}** · {len(beats)} beats generated")
+    if seq.get("reasoning"):
+        with st.expander("Why this sequence?", expanded=False):
+            st.caption(seq["reasoning"])
+
     for b in beats:
         with st.expander(f"Beat {b.get('beatNumber','?')} — {b.get('beatType','')}", expanded=False):
             st.markdown(f"**Narrative context:** {b.get('narrativeContext','')}")
@@ -741,6 +801,7 @@ if st.session_state["s6_status"] == "done":
                 st.caption(b.get('hookDirective',''))
             st.caption(
                 f"Min turns: {b.get('minTurnsInBeat','?')} · "
+                f"Max turns: {b.get('maxTurnsInBeat','?')} · "
                 f"Advance score: {b.get('engagedAdvanceScore','?')}"
             )
     if st.button("Regenerate Beats", key="regen_s6"):
@@ -751,23 +812,63 @@ elif st.session_state["s6_status"] == "error":
     if st.button("Retry Step 6"):
         _clear_from(6); st.rerun()
 
+elif not prev_done(6):
+    st.caption("Complete Step 5 first.")
+
 else:
-    if st.button("✨ Generate Beat Fields", key="run_s6", type="primary", disabled=not prev_done(6)):
-        scenario_fields = st.session_state["s4_scenario_fields"]
-        char_fields     = st.session_state["s1_char_fields"]
-        with st.spinner("Generating beat fields…"):
-            try:
-                beats = generate_beat_fields(beat_inputs, scenario_fields, char_fields)
-                st.session_state["s6_beat_fields"] = beats
-                st.session_state["s6_status"] = "done"
-            except Exception as e:
-                st.session_state["s6_status"] = "error"
-                st.session_state["s6_error"] = str(e)
-                with st.expander("Error details"):
-                    st.code(traceback.format_exc())
-        st.rerun()
-    if not prev_done(6):
-        st.caption("Complete Step 5 first.")
+    scenario_fields = st.session_state["s4_scenario_fields"]
+    char_fields     = st.session_state["s1_char_fields"]
+
+    # ── Phase 1: Generate beat sequence ──────────────────────────────────
+    if not _s6_seq:
+        if st.button("🎯 Generate Beat Sequence", key="run_s6_seq", type="primary"):
+            with st.spinner("Designing optimal beat sequence…"):
+                try:
+                    seq = generate_beat_sequence(
+                        scenario_fields, char_fields,
+                        test_moment_hint=beat_inputs.get("test_moment_desc", ""),
+                    )
+                    st.session_state["s6_beat_sequence"] = seq
+                except Exception as e:
+                    st.session_state["s6_status"] = "error"
+                    st.session_state["s6_error"] = str(e)
+                    with st.expander("Error details"):
+                        st.code(traceback.format_exc())
+            st.rerun()
+
+    # ── Phase 2: Review sequence → Generate beat fields ──────────────────
+    else:
+        seq = _s6_seq
+        seq_labels = " → ".join(seq.get("beat_sequence", []))
+        st.success(f"Beat sequence: **{seq_labels}**")
+        if seq.get("reasoning"):
+            st.caption(seq["reasoning"])
+        if seq.get("test_moment_desc"):
+            st.caption(f"Twist moment: _{seq['test_moment_desc']}_")
+
+        col_gen, col_redo = st.columns([3, 1])
+        with col_gen:
+            if st.button("✨ Generate Beat Fields", key="run_s6_fields", type="primary"):
+                with st.spinner("Generating beat fields…"):
+                    try:
+                        beats = generate_beat_fields(
+                            beat_sequence=seq["beat_sequence"],
+                            scenario=scenario_fields,
+                            character=char_fields,
+                            test_moment_desc=seq.get("test_moment_desc", ""),
+                        )
+                        st.session_state["s6_beat_fields"] = beats
+                        st.session_state["s6_status"] = "done"
+                    except Exception as e:
+                        st.session_state["s6_status"] = "error"
+                        st.session_state["s6_error"] = str(e)
+                        with st.expander("Error details"):
+                            st.code(traceback.format_exc())
+                st.rerun()
+        with col_redo:
+            if st.button("↺ Redo Sequence", key="redo_s6_seq"):
+                st.session_state["s6_beat_sequence"] = None
+                st.rerun()
 
 
 # ─── STEP 7 — Generate Storyline (Writer + Editor loop) ──────────────────
@@ -936,13 +1037,16 @@ if st.session_state["s8_status"] == "done":
     script = st.session_state["s8_script"]
     segs   = script.get("segments", [])
     st.caption(f"{len(segs)} segments · {len(segs) * seg_dur}s total")
-    for seg in segs:
-        sn = seg["segment_number"]
+    for i, seg in enumerate(segs, 1):
+        sn = seg.get("segment_number", i)
         with st.expander(f"Segment {sn}", expanded=(sn == 1)):
             c1, c2, c3 = st.columns(3)
             c1.markdown("**Scene**");    c1.caption(seg.get("scene_description", ""))
             c2.markdown("**Shot**");     c2.caption(seg.get("shot_description", ""))
             c3.markdown("**Dialogue**"); c3.caption(seg.get("dialogue", ""))
+            objs = seg.get("objects", [])
+            if objs:
+                st.caption("**Objects:** " + ", ".join(objs))
     if st.button("Regenerate Script", key="regen_s8"):
         _clear_from(8); st.rerun()
 
@@ -958,7 +1062,7 @@ else:
             ch = st.session_state["s1_char_fields"]
             with st.spinner("Writing roleplay teaser screenplay…"):
                 try:
-                    script = generate_video_scene_script(sc, ch, num_segments=5, segment_duration=8)
+                    script = generate_video_scene_script(sc, ch, num_segments=5, segment_duration=8, user_name=st.session_state.get("viewer_name", ""))
                     st.session_state["s8_script"] = script
                     st.session_state["s8_status"] = "done"
                 except Exception as e:
@@ -971,15 +1075,142 @@ else:
         st.caption("Complete Step 7 first.")
 
 
-# ─── STEP 9 — Generate Video Segments (Veo3, chained) ────────────────────
+# ─── STEP 8b — Generate Voice-Over Script ────────────────────────────────
+st.divider()
+step_header_sub("8b", "Generate Voice-Over Script")
+_s8_done = st.session_state["s8_status"] == "done"
+
+if st.session_state["s8b_status"] == "done":
+    edited_script = st.text_area(
+        "Voice-over script (edit if desired before generating audio)",
+        value=st.session_state["s8b_audio_script"],
+        height=150,
+        key="s8b_script_editor",
+    )
+    if edited_script != st.session_state["s8b_audio_script"]:
+        st.session_state["s8b_audio_script"] = edited_script
+        for k in ["s8c_status", "s8c_audio_path", "s10b_status", "s10b_final_path"]:
+            st.session_state[k] = _DEFAULTS[k]
+    if st.button("Regenerate Voice-Over Script", key="regen_s8b"):
+        for k in ["s8b_status", "s8b_audio_script", "s8c_status", "s8c_audio_path",
+                  "s10b_status", "s10b_final_path"]:
+            st.session_state[k] = _DEFAULTS[k]
+        st.rerun()
+
+elif st.session_state["s8b_status"] == "error":
+    st.error(st.session_state.get("s8b_error", "Unknown error"))
+    if st.button("Retry Step 8b"):
+        st.session_state["s8b_status"] = "pending"
+        st.rerun()
+
+else:
+    if _s8_done:
+        if st.button("📝 Generate Voice-Over Script", key="run_s8b", type="primary"):
+            ch   = st.session_state["s1_char_fields"]
+            segs = st.session_state["s8_script"].get("segments", [])
+            with st.spinner("Writing voice-over script…"):
+                try:
+                    script_text = generate_audio_script(segs, ch)
+                    st.session_state["s8b_audio_script"] = script_text
+                    st.session_state["s8b_status"] = "done"
+                except Exception as e:
+                    st.session_state["s8b_status"] = "error"
+                    st.session_state["s8b_error"] = str(e)
+                    with st.expander("Error details"):
+                        st.code(traceback.format_exc())
+            st.rerun()
+    else:
+        st.caption("Complete Step 8 first.")
+
+
+# ─── STEP 8c — Generate ElevenLabs Audio ─────────────────────────────────
+st.divider()
+step_header_sub("8c", "Generate Voice Audio (ElevenLabs via fal.ai)")
+_s8b_done = st.session_state["s8b_status"] == "done"
+
+if st.session_state["s8c_status"] == "done":
+    st.audio(st.session_state["s8c_audio_path"])
+    if st.button("Regenerate Audio", key="regen_s8c"):
+        for k in ["s8c_status", "s8c_audio_path", "s10b_status", "s10b_final_path"]:
+            st.session_state[k] = _DEFAULTS[k]
+        st.rerun()
+
+elif st.session_state["s8c_status"] == "error":
+    st.error(st.session_state.get("s8c_error", "Unknown error"))
+    if st.button("Retry Step 8c"):
+        st.session_state["s8c_status"] = "pending"
+        st.rerun()
+
+else:
+    if _s8b_done:
+        # Load and cache available voices
+        if not st.session_state.get("voices_cache"):
+            with st.spinner("Loading available voices…"):
+                try:
+                    st.session_state["voices_cache"] = list_voices()
+                except Exception:
+                    st.session_state["voices_cache"] = []
+
+        voices = st.session_state["voices_cache"]
+
+        # Manual voice ID override — takes priority over dropdown
+        manual_vid = st.text_input(
+            "Voice ID (paste directly to override dropdown)",
+            value=st.session_state.get("manual_voice_id", ""),
+            placeholder="e.g. 21m00Tcm4TlvDq8ikWAM",
+            key="s8c_manual_voice_id",
+        )
+        if manual_vid.strip():
+            st.session_state["manual_voice_id"] = manual_vid.strip()
+            st.session_state["selected_voice_id"] = manual_vid.strip()
+            st.caption(f"Using manual voice ID: `{manual_vid.strip()}`")
+        else:
+            st.session_state["manual_voice_id"] = ""
+            if voices:
+                current_vid = st.session_state.get("selected_voice_id") or ELEVENLABS_VOICE_ID
+                default_idx = next((i for i, v in enumerate(voices) if v["voice_id"] == current_vid), 0)
+                selected = st.selectbox(
+                    "Or choose from loaded voices",
+                    options=voices,
+                    index=default_idx,
+                    format_func=lambda v: v["name"],
+                    key="s8c_voice_select",
+                )
+                st.session_state["selected_voice_id"] = selected["voice_id"]
+            else:
+                st.caption("Could not load voice list — paste a voice ID above or the default will be used.")
+
+        if st.button("🎙️ Generate Voice Audio", key="run_s8c", type="primary"):
+            voice_id    = st.session_state.get("selected_voice_id") or ELEVENLABS_VOICE_ID
+            script_text = st.session_state["s8b_audio_script"]
+            with st.spinner("Generating audio via ElevenLabs…"):
+                try:
+                    audio_path = generate_audio_fal(script_text, voice_id)
+                    st.session_state["s8c_audio_path"] = audio_path
+                    st.session_state["s8c_status"] = "done"
+                except Exception as e:
+                    st.session_state["s8c_status"] = "error"
+                    st.session_state["s8c_error"] = str(e)
+                    with st.expander("Error details"):
+                        st.code(traceback.format_exc())
+            st.rerun()
+    else:
+        st.caption("Complete Step 8b first.")
+
+
+# ─── STEP 9 — Generate Video Segments (Veo3, chained) ───────────────────
 st.divider()
 step_header(9, "Generate Video Segments (Veo3)")
 _s8_done = st.session_state["s8_status"] == "done"
 
 
 def _build_segment_prompt(seg: dict) -> str:
-    """Build the default Veo3 prompt for a single segment."""
-    parts = [seg.get("scene_description", "").strip(), seg.get("shot_description", "").strip()]
+    """Build the Seedance prompt for a single segment."""
+    parts = []
+    objs = seg.get("objects", [])
+    if objs:
+        parts.append(f"Visible objects in scene: {', '.join(objs)}.")
+    parts += [seg.get("scene_description", "").strip(), seg.get("shot_description", "").strip()]
     dialogue = seg.get("dialogue", "").strip()
     if dialogue:
         parts.append(
@@ -999,6 +1230,7 @@ def _run_step9():
     done_so_far = st.session_state["s9_segment_paths"]
     resume_from = len(done_so_far)
     seg_prompts = st.session_state.get("s9_segment_prompts", {})
+    avatar_desc = (st.session_state.get("s1_char_fields") or {}).get("avatarPrompt", "")
 
     current_ref   = st.session_state["s2_image_path"] if resume_from == 0 else extract_last_frame(done_so_far[-1])
     segment_paths = list(done_so_far)
@@ -1013,18 +1245,18 @@ def _run_step9():
 
             status_text = st.empty()
             seg_start   = time.time()
-            status_text.info(f"**Segment {n}/{total}** — submitting to Veo3…")
+            status_text.info(f"**Segment {n}/{total}** — submitting to video model…")
 
             def _make_cb(ph, sn, st_total, t0):
                 def _cb(elapsed, status):
                     mins, secs = divmod(elapsed, 60)
                     tstr = f"{mins}m {secs}s" if mins else f"{secs}s"
-                    ph.info(f"**Segment {sn}/{st_total}** — Veo3 generating… Status: `{status}` · {tstr}")
+                    ph.info(f"**Segment {sn}/{st_total}** —  generating… Status: `{status}` · {tstr}")
                 return _cb
 
             if custom_prompt:
                 # User provided a full custom prompt — pass scene/shot as empty to avoid duplication
-                from steps.veo3_generator import _critique_veo3_prompt, _rewrite_veo3_prompt
+                from steps.seedance_generator import _critique_prompt as _critique_veo3_prompt, _rewrite_prompt as _rewrite_veo3_prompt
                 _MAX_TRIES = 3
                 prompt = custom_prompt
                 for _att in range(_MAX_TRIES):
@@ -1040,6 +1272,7 @@ def _run_step9():
                     dialogue="",
                     continuation_note="",
                     duration=seg_dur,
+                    avatar_description=avatar_desc,
                     on_progress=_make_cb(status_text, n, total, seg_start),
                 )
             else:
@@ -1051,6 +1284,7 @@ def _run_step9():
                     dialogue=seg.get("dialogue", ""),
                     continuation_note=cont,
                     duration=seg_dur,
+                    avatar_description=avatar_desc,
                     on_progress=_make_cb(status_text, n, total, seg_start),
                 )
 
@@ -1159,6 +1393,48 @@ else:
         st.caption("Complete Step 9 first.")
 
 
+# ─── STEP 10b — HeyGen Lipsync ───────────────────────────────────────────
+st.divider()
+step_header_sub("10b", "Lipsync (HeyGen Precision via fal.ai)")
+_s10_done  = st.session_state["s10_status"] == "done"
+_s8c_done  = st.session_state["s8c_status"] == "done"
+_lipsync_ready = _s10_done and _s8c_done
+
+if st.session_state["s10b_status"] == "done":
+    _show_video(st.session_state["s10b_final_path"], label="▶ Lipsynced final video")
+    if st.button("Redo Lipsync", key="regen_s10b"):
+        for k in ["s10b_status", "s10b_final_path", "s11_status", "s11_final_path"]:
+            st.session_state[k] = _DEFAULTS[k]
+        st.rerun()
+
+elif st.session_state["s10b_status"] == "error":
+    st.error(st.session_state.get("s10b_error", "Unknown error"))
+    if st.button("Retry Step 10b"):
+        st.session_state["s10b_status"] = "pending"
+        st.rerun()
+
+else:
+    if st.button("🎤 Lipsync & Finalize", key="run_s10b", type="primary", disabled=not _lipsync_ready):
+        with st.spinner("Uploading files and running HeyGen lipsync…"):
+            try:
+                final_path = lipsync_heygen(
+                    st.session_state["s10_combined_path"],
+                    st.session_state["s8c_audio_path"],
+                )
+                st.session_state["s10b_final_path"] = final_path
+                st.session_state["s10b_status"] = "done"
+            except Exception as e:
+                st.session_state["s10b_status"] = "error"
+                st.session_state["s10b_error"] = str(e)
+                with st.expander("Error details"):
+                    st.code(traceback.format_exc())
+        st.rerun()
+    if not _s10_done:
+        st.caption("Complete Step 10 (Concatenate) first.")
+    elif not _s8c_done:
+        st.caption("Complete Step 8c (Voice Audio) first.")
+
+
 # ─── STEP 11 — Final Video ────────────────────────────────────────────────
 st.divider()
 step_header(11, "Final Video")
@@ -1176,16 +1452,14 @@ elif st.session_state["s11_status"] == "error":
 else:
     if st.button("✅ Set as Final Video", key="run_s11", type="primary", disabled=not prev_done(11)):
         try:
-            st.session_state["s11_final_path"] = st.session_state["s10_combined_path"]
+            st.session_state["s11_final_path"] = st.session_state["s10b_final_path"]
             st.session_state["s11_status"] = "done"
         except Exception as e:
             st.session_state["s11_status"] = "error"
             st.session_state["s11_error"] = str(e)
         st.rerun()
     if not prev_done(11):
-        st.caption("Complete Step 10 first.")
-    else:
-        st.caption("Veo3 generates audio natively — the concatenated video is your final output.")
+        st.caption("Complete Step 10b (Lipsync) first.")
 
 
 # ══════════════════════════════════════════════════════════════════════════

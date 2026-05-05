@@ -3,23 +3,28 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+FAL_KEY = os.environ.get("FAL_KEY", "")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "wingman-media")
 
-GEMINI_TEXT_MODEL = "gemini-2.5-flash"
-GEMINI_IMAGE_MODEL = "gemini-3-pro-image-preview"
-CLAUDE_MODEL = "claude-sonnet-4-5"
 ELEVENLABS_MODEL = "eleven_multilingual_v2"
 ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"  # George — default premade voice
 
-VEO3_MODEL = "veo-3.1-generate-preview"
+SEGMENT_DURATION = 5  # seconds per video clip
 
-SEGMENT_DURATION = 5   # seconds per Veo3 clip (5 or 10)
+# fal.ai model IDs
+FAL_IMAGE_MODEL      = os.environ.get("FAL_IMAGE_MODEL",      "fal-ai/flux-pro/v1.1")
+FAL_VIDEO_MODEL      = os.environ.get("FAL_VIDEO_MODEL",      "bytedance/seedance-2.0/fast/image-to-video")
+FAL_ELEVENLABS_MODEL = os.environ.get("FAL_ELEVENLABS_MODEL", "fal-ai/elevenlabs/tts/eleven-v3")
+FAL_LIPSYNC_MODEL    = os.environ.get("FAL_LIPSYNC_MODEL",    "fal-ai/heygen/v3/lipsync/precision")
+
+# OpenRouter model IDs for LLM text calls
+OR_CLAUDE_MODEL = os.environ.get("OR_CLAUDE_MODEL", "anthropic/claude-sonnet-4-5")
+OR_GEMINI_MODEL = os.environ.get("OR_GEMINI_MODEL", "google/gemini-2.5-flash")
 
 # City → ElevenLabs accent hint mapping (used in TTS voice direction)
 CITY_ACCENT_MAP = {
@@ -42,8 +47,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 def validate_keys() -> list[str]:
     """Return list of missing API key names."""
     missing = []
-    if not GOOGLE_API_KEY:
-        missing.append("GOOGLE_API_KEY")
+    if not FAL_KEY:
+        missing.append("FAL_KEY")
+    if not OPENROUTER_API_KEY:
+        missing.append("OPENROUTER_API_KEY")
     if not ELEVENLABS_API_KEY:
         missing.append("ELEVENLABS_API_KEY")
     if not SUPABASE_URL:

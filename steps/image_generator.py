@@ -1,60 +1,88 @@
+import logging
 import os
+import time
 import uuid
-from google import genai
-from google.genai import types
-from config import GOOGLE_API_KEY, GEMINI_IMAGE_MODEL, OUTPUT_DIR
+import requests
+from requests.exceptions import ChunkedEncodingError, ReadTimeout
+from fal_client import SyncClient
+from config import FAL_KEY, FAL_IMAGE_MODEL, OUTPUT_DIR
+
+log = logging.getLogger(__name__)
+
+_fal = SyncClient(key=FAL_KEY)
 
 
-client = genai.Client(api_key=GOOGLE_API_KEY)
+def _download_with_retry(url: str, max_attempts: int = 5) -> bytes:
+    last_exc = None
+    for attempt in range(max_attempts):
+        delay = 2 ** attempt
+        try:
+            r = requests.get(url, timeout=120)
+            if r.status_code == 502:
+                log.warning("fal download attempt %d/%d: 502, retrying in %ds", attempt + 1, max_attempts, delay)
+                time.sleep(delay)
+                continue
+            r.raise_for_status()
+            return r.content
+        except ReadTimeout as exc:
+            last_exc = exc
+            log.warning("fal download attempt %d/%d: ReadTimeout, retrying in %ds", attempt + 1, max_attempts, delay)
+            time.sleep(delay)
+        except ChunkedEncodingError as exc:
+            last_exc = exc
+            log.warning("fal download attempt %d/%d: IncompleteRead — %s, retrying in %ds", attempt + 1, max_attempts, exc, delay)
+            time.sleep(delay)
+    raise RuntimeError(f"fal image download failed after {max_attempts} attempts: {last_exc}")
 
 
-def generate_image(enhanced_prompt: str) -> str:
+def _fal_generate(prompt: str, image_url: str = None) -> str:
+    """Single fal call. Returns the image URL from the result."""
+    args = {
+        "prompt": prompt,
+        "image_size": "portrait_4_3",
+        "num_images": 1,
+        "output_format": "jpeg",
+        "safety_tolerance": 3,
+    }
+    if image_url:
+        args["image_url"] = image_url
+
+    result = _fal.subscribe(FAL_IMAGE_MODEL, arguments=args)
+    log.debug("fal raw response: %s", result)
+
+    images = result.get("images", [])
+    if not images:
+        raise RuntimeError("fal.ai returned no images.")
+    return images[0]["url"]
+
+
+def generate_image(enhanced_prompt: str) -> list[str]:
     """
-    Generate an image from the enhanced prompt using Gemini.
-    Returns the file path to the saved image.
+    Generate two portraits. First is text-only; second uses the first as image input
+    so fal produces the same face and features with a different composition.
+    Returns two local file paths.
     """
-    response = client.models.generate_content(
-        model=GEMINI_IMAGE_MODEL,
-        contents=enhanced_prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            image_config=types.ImageConfig(aspect_ratio="9:16"),
-        ),
-    )
+    log.info("Generating portrait 1 (text-only)")
+    url1 = _fal_generate(enhanced_prompt)
+    log.info("Portrait 1 URL: %s", url1)
 
-    # Find the image part in the response
-    candidates = response.candidates or []
-    if not candidates:
-        raise RuntimeError(
-            "Gemini returned no candidates. The prompt was likely blocked by content safety filters. "
-            "Try rephrasing your prompt."
-        )
+    log.info("Generating portrait 2 (using portrait 1 as image input)")
+    url2 = _fal_generate(enhanced_prompt, image_url=url1)
+    log.info("Portrait 2 URL: %s", url2)
 
-    content = candidates[0].content
-    if content is None or not content.parts:
-        finish_reason = getattr(candidates[0], "finish_reason", "unknown")
-        raise RuntimeError(
-            f"Gemini returned a candidate with no image content (finish_reason={finish_reason}). "
-            "The prompt may have been blocked by content safety filters. Try rephrasing your prompt."
-        )
+    filepaths = []
+    for url in (url1, url2):
+        content = _download_with_retry(url)
+        filename = f"image_{uuid.uuid4().hex[:8]}.jpg"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(content)
+        log.info("Saved %s (%d bytes)", filepath, len(content))
+        filepaths.append(filepath)
 
-    for part in content.parts:
-        if part.inline_data is not None:
-            image = part.as_image()
-            filename = f"image_{uuid.uuid4().hex[:8]}.png"
-            filepath = os.path.join(OUTPUT_DIR, filename)
-            image.save(filepath)
-            return filepath
-
-    raise RuntimeError(
-        "Gemini returned a response but with no image data inside it. "
-        "The prompt may have been blocked by content safety filters. Try rephrasing your prompt."
-    )
+    return filepaths
 
 
-def generate_images(enhanced_prompt: str, count: int = 2) -> list[str]:
-    """
-    Generate `count` images from the same prompt.
-    Returns a list of file paths to the saved images.
-    """
-    return [generate_image(enhanced_prompt) for _ in range(count)]
+def generate_images(enhanced_prompt: str) -> str:
+    """Convenience wrapper — returns the first image path."""
+    return generate_image(enhanced_prompt)[0]

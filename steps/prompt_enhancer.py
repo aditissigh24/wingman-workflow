@@ -1,16 +1,23 @@
 """
 LLM generation functions for character, scenario, and beat field derivation.
-Writer agents use Gemini; critique/editor agents use Claude.
+All LLM calls go through utils.llm_client (OpenRouter).
+Writer/prompt agents use Gemini; critique/editor agents use Claude.
 """
 
 import json
-import anthropic
-from google import genai
-from google.genai import types
-from config import GOOGLE_API_KEY, GEMINI_TEXT_MODEL, SEGMENT_DURATION, ANTHROPIC_API_KEY, CLAUDE_MODEL
+from utils import llm_client
+from config import SEGMENT_DURATION
 
-client = genai.Client(api_key=GOOGLE_API_KEY)
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+def _parse_json_response(text: str) -> dict | list:
+    """Strip markdown fences and parse JSON."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.rsplit("```", 1)[0].strip()
+    return json.loads(text)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -26,18 +33,13 @@ def enhance_image_prompt(
     Expand an image description into a detailed generation prompt.
 
     Portrait mode (scenario=None): expands avatarPrompt into a hyper-realistic
-    character portrait prompt — behaviour identical to the original function.
+    character portrait prompt behaviour identical to the original function.
 
     Poster mode (scenario provided): uses the full scenario + character context
     to produce a cinematic movie poster prompt for the scenario's roleplay.
     """
     if scenario is None:
-        # ── Portrait mode (original behaviour, unchanged) ─────────────────
-        response = client.models.generate_content(
-            model=GEMINI_TEXT_MODEL,
-            contents=avatar_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=(
+        system = (
                     "You are an expert AI portrait photographer and prompt engineer. "
                     "Expand the given avatar description into a single detailed image generation prompt "
                     "for a hyper-realistic Indian human character.\n\n"
@@ -51,18 +53,15 @@ def enhance_image_prompt(
                     "- Framing: waist-up shot, character filling 65% of the frame, looking toward camera\n"
                     "- Lighting: warm, city-appropriate, golden-hour or soft diffused window light\n"
                     "- Background: simple, bokeh-blurred\n"
-                    "- Camera: 85mm portrait lens, f/1.8, photorealistic, cinematic color grade, Sony A7R IV\n\n"
+                    "- Camera: -Camera: shot on iPhone 14, slightly soft lens, natural colors," 
+                    "no professional lighting setup, candid feel, slight digital noise\n\n"
                     "The image will be the starting frame for a video — ensure breathing room around the character. "
                     "Output ONLY the final prompt text. No preamble, no labels, no explanation."
-                ),
-                # max_output_tokens=1024,
-            ),
-        )
-        return response.text.strip()
+                )
+        return llm_client.complete(system=system, user=avatar_prompt, model="gemini")
 
-    # ── Poster mode ────────────────────────────────────────────────────────
     char = character or {}
-    contents = (
+    user_content = (
         f"SCENARIO TITLE: {scenario.get('scenarioTitle', '')}\n"
         f"TAGLINE: {scenario.get('tagline', '')}\n"
         f"TONE: {scenario.get('tone', '')}\n"
@@ -77,7 +76,7 @@ def enhance_image_prompt(
         f"CHARACTER VISUAL SEED: {char.get('avatarPrompt', '')[:120]}"
     )
 
-    system_instruction = (
+    system = (
         "You are a Bollywood-adjacent movie poster art director and AI image prompt engineer.\n\n"
         "Your task: write a single, detailed image generation prompt that would produce a cinematic "
         "movie poster for an Indian social roleplay scenario — one image that makes the viewer instantly "
@@ -109,30 +108,17 @@ def enhance_image_prompt(
         "- Do NOT mention any real celebrity, public figure, brand, or trademarked name\n"
         "- Output ONLY the final prompt text. No preamble, no labels, no explanation."
     )
-
-    response = client.models.generate_content(
-        model=GEMINI_TEXT_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            # max_output_tokens=1024,
-        ),
-    )
-    return response.text.strip()
+    return llm_client.complete(system=system, user=user_content, model="gemini")
 
 
 def generate_poster_fields(character: dict, scenario: dict) -> dict:
     """
     Generate structured poster input fields from character + scenario context.
-
-    Returns a dict with keys:
-        character, scenario, emotion_vibe, setting, visual_style,
-        camera_lighting, wardrobe, text_overlay (str or None)
     """
     char = character or {}
     scen = scenario or {}
 
-    contents = (
+    user_content = (
         f"CHARACTER NAME: {char.get('name', '')}\n"
         f"CHARACTER AGE: {char.get('age', '')}\n"
         f"CHARACTER ARCHETYPE: {char.get('archetype', '')}\n"
@@ -150,7 +136,7 @@ def generate_poster_fields(character: dict, scenario: dict) -> dict:
         f"BAD OUTCOME: {scen.get('badOutcome', '')}\n"
     )
 
-    system_instruction = (
+    system = (
         "You are a Bollywood-adjacent movie poster art director.\n\n"
         "From the character and scenario inputs, generate structured poster design fields.\n\n"
         "Return a single JSON object with EXACTLY these keys:\n\n"
@@ -174,22 +160,14 @@ def generate_poster_fields(character: dict, scenario: dict) -> dict:
         "- Do NOT mention any real celebrity, public figure, brand, or trademarked name\n"
         "Output ONLY the JSON object. No preamble, no explanation."
     )
-
-    response = client.models.generate_content(
-        model=GEMINI_TEXT_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-        ),
-    )
-    return _parse_json_response(response.text)
+    result = llm_client.complete(system=system, user=user_content, model="gemini")
+    return _parse_json_response(result)
 
 
 def assemble_poster_prompt(fields: dict) -> str:
     """
     Assemble the final image generation prompt from structured poster fields.
-    Pure Python — no LLM call. The text_overlay line is only included when non-null/non-empty.
+    Pure Python — no LLM call.
     """
     text_overlay = fields.get("text_overlay") or ""
     overlay_line = f'\nText overlay: "{text_overlay}".' if text_overlay.strip() else ""
@@ -211,37 +189,19 @@ def enhance_audio_prompt(dialogues: str) -> str:
     Add TTS delivery cues (pauses, breathing points) to the dialogue script.
     Does NOT change any words — only adjusts punctuation and pacing.
     """
-    response = client.models.generate_content(
-        model=GEMINI_TEXT_MODEL,
-        contents=dialogues,
-        config=types.GenerateContentConfig(
-            system_instruction=(
-                "You are a voice director preparing a script for text-to-speech. "
-                "Your ONLY job is to add natural pacing markers so the TTS engine sounds human.\n\n"
-                "Rules — strictly follow all of them:\n"
-                "- Do NOT change, add, remove, or rephrase any words\n"
-                "- Do NOT rewrite sentences or change their order\n"
-                "- Do NOT translate or transliterate — preserve the exact language and script of the input\n"
-                "- ONLY add '...' at natural breath points or where a real speaker would pause\n"
-                "- ONLY adjust commas and periods to improve rhythm\n"
-                "- The output must contain every word from the input, unchanged\n\n"
-                "Output ONLY the pacing-adjusted script. No preamble, no explanation."
-            ),
-            # max_output_tokens=2048,
-        ),
+    system = (
+        "You are a voice director preparing a script for text-to-speech. "
+        "Your ONLY job is to add natural pacing markers so the TTS engine sounds human.\n\n"
+        "Rules — strictly follow all of them:\n"
+        "- Do NOT change, add, remove, or rephrase any words\n"
+        "- Do NOT rewrite sentences or change their order\n"
+        "- Do NOT translate or transliterate — preserve the exact language and script of the input\n"
+        "- ONLY add '...' at natural breath points or where a real speaker would pause\n"
+        "- ONLY adjust commas and periods to improve rhythm\n"
+        "- The output must contain every word from the input, unchanged\n\n"
+        "Output ONLY the pacing-adjusted script. No preamble, no explanation."
     )
-    return response.text.strip()
-
-
-def _parse_json_response(text: str) -> dict | list:
-    """Strip markdown fences and parse JSON."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.rsplit("```", 1)[0].strip()
-    return json.loads(text)
+    return llm_client.complete(system=system, user=dialogues, model="gemini")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -251,16 +211,6 @@ def _parse_json_response(text: str) -> dict | list:
 def generate_character_fields(user_inputs: dict) -> dict:
     """
     Given the 6 character inputs (C1–C6), generate all LLM-derived Character DB fields.
-
-    Input keys:
-        archetype_phrase          (C1) — "The Girl Next Door Who Got Hot"
-        core_life_tension         (C2) — "30+ DMs, tired of creeps, but secretly hoping"
-        city                      (C3) — "Indore"
-        signature_comm_behavior   (C4) — "Deliberately waits 5–10 min before replying"
-        what_she_never_does       (C5) — "Never says she likes someone first"
-        physical_vibe             (C6) — "Fit, casual, golden hour, homely"
-
-    Returns a dict with all character DB fields.
     """
     c1 = user_inputs.get("archetype_phrase", "")
     c2 = user_inputs.get("core_life_tension", "")
@@ -278,7 +228,7 @@ def generate_character_fields(user_inputs: dict) -> dict:
         f"PHYSICAL VIBE (C6): {c6}"
     )
 
-    system_instruction = """You are a character designer for a culturally-grounded Indian social roleplay app.
+    system = """You are a character designer for a culturally-grounded Indian social roleplay app.
 Your task: from 6 minimal creative inputs, generate a fully-realized Indian female character.
 ALL output must be deeply specific to the city, class, and archetype given. Generic output is a failure.
 
@@ -294,7 +244,7 @@ OUTPUT: Return a single JSON object with EXACTLY these keys:
   "speakingStyle": "<dialect pattern for this city — filler words, reply length, code-switching ratio, sentence rhythm>",
   "emojiUsage": "<how and when she uses emojis — frequency, types, emotional register they signal>",
   "textingSpeed": "<behavioral description of her reply timing and what it communicates>",
-  "voicePrompt": "<full LLM character card — how to stay in voice: what she does when nervous/comfortable/irritated, specific verbal tics, what topics she warms to vs deflects, 200-300 words>",
+  "voicePrompt": "<full LLM character card written entirely in 2nd person — start with 'You are [Name]...' then describe: what you do when nervous/comfortable/irritated, your specific verbal tics, topics you warm to vs deflect. Write as if instructing the AI to BE this character. Never use she/her. 200-300 words>",
   "hardLimits": ["<rule 1 as character truth>", "<rule 2>", "<rule 3>", "<rule 4>"],
   "avatarPrompt": "<image gen prompt: person wearing city-appropriate outfit + physical vibe + location + lighting — written as a scene>",
   "accentHsl": "<HSL color string e.g. hsl(28, 70%, 55%) — warm/cool/earthy palette from archetype + vibe>"
@@ -302,24 +252,16 @@ OUTPUT: Return a single JSON object with EXACTLY these keys:
 
 Rules:
 - hardLimits: exactly 4 items. Write as character truths ("She never..."), not restrictions.
-- voicePrompt: write in 2nd person ("You are..."). Be specific — not "she is warm" but "she laughs quietly before answering the hard question."
+- voicePrompt: write entirely in 2nd person. Start with "You are [Name]..." — NEVER use she/her anywhere in this field. Every sentence must address the AI directly: "You laugh quietly before answering the hard question", not "she laughs quietly."
 - avatarPrompt: write as a visual scene description, not a spec sheet. Include exact setting from city.
 - accentHsl: pick a color that emotionally matches her vibe (e.g. warm amber for Indore, cool blue-grey for Delhi, earthy green for Lucknow).
 
 Output ONLY the JSON object. No explanation, no preamble."""
 
-    response = client.models.generate_content(
-        model=GEMINI_TEXT_MODEL,
-        contents=user_content,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            # max_output_tokens=4096,
-            response_mime_type="application/json",
-        ),
-    )
-    result = _parse_json_response(response.text)
-    result["city"] = c3  # city comes from user input, not LLM
-    return result
+    result = llm_client.complete(system=system, user=user_content, model="gemini", max_tokens=4096)
+    parsed = _parse_json_response(result)
+    parsed["city"] = c3
+    return parsed
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -330,13 +272,6 @@ def generate_scenario_fields(user_inputs: dict, character: dict) -> dict:
     """
     Given the 5 scenario inputs (S1–S5) and the character context,
     generate all LLM-derived Scenario DB fields.
-
-    Input keys:
-        trigger_detail      (S1) — hyper-specific situation trigger
-        primal_fear         (S2) — user's emotional fear/insecurity
-        emotional_state_now (S3) — character's exact emotional state at scenario start
-        time_and_place      (S4) — where + when the scene is set
-        arc_destination     (S5) — where it ends if user does everything right
     """
     s1 = user_inputs.get("trigger_detail", "")
     s2 = user_inputs.get("primal_fear", "")
@@ -358,7 +293,7 @@ def generate_scenario_fields(user_inputs: dict, character: dict) -> dict:
         f"ARC DESTINATION (S5): {s5}"
     )
 
-    system_instruction = """You are a narrative designer for a culturally-grounded Indian social roleplay app.
+    system = """You are a narrative designer for a culturally-grounded Indian social roleplay app.
 Your task: from 5 scenario inputs + a character context, generate a fully-realized scenario.
 Everything must feel specific, cinematic, and emotionally true. Generic output is a failure.
 
@@ -379,31 +314,23 @@ OUTPUT: Return a single JSON object with EXACTLY these keys:
   "overallArc": "<one-sentence narrative journey: start → end>",
   "tone": "<compound descriptor e.g. playful-guarded / dry-curious / warm-charged / tense-nostalgic>",
   "timeOfDay": "<from S4 — formatted as e.g. '11pm' or 'golden hour, ~6:30pm'>",
-  "initialMessages": [
-        "<first message — short casual opener>",
-        "<second message — adds context or a hook (optional third message if the opening naturally needs it)>"
-    ],  
+  ""initialMessages": [
+    "<Character's first line of dialogue — what SHE says to open the scene. Written in first person from her POV. Natural, in-character, not instructional.>",
+    "<Her follow-up line — continues her thought, reveals her mood or something about the situation. Still her voice, not a prompt to the user.>"
+],
    "initialChips": ["<funny reply chip>", "<direct reply chip>", "<curious reply chip>", "<bold reply chip>"]
 }
 
 Rules:
 - difficulty: Easy = surface social. Medium = class/relationship tension. Hard = deep emotional stakes.
-- initialMessages: 2–3 sequential messages she sends in a row to open the conversation. Start short and casual, end on the emotionally loaded line. Use 2 if the opening lands in 2 beats; use 3 if it needs a middle beat. Written in her exact speaking style. These are NOT options — they are messages 1, 2, (optionally 3) in the thread.
+- initialMessages: 2–3 sequential messages she (the character AI will play) sends in a row to open the conversation.
 - initialChips: 4 reply options the user can tap. Each one distinct. Written from the user's POV.
 - situationSetupForUser: MUST end with an unresolved moment or micro-decision. Use "tu" as user pronoun.
 
 Output ONLY the JSON object. No explanation, no preamble."""
 
-    response = client.models.generate_content(
-        model=GEMINI_TEXT_MODEL,
-        contents=user_content,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            # max_output_tokens=4096,
-            response_mime_type="application/json",
-        ),
-    )
-    return _parse_json_response(response.text)
+    result = llm_client.complete(system=system, user=user_content, model="gemini", max_tokens=4096)
+    return _parse_json_response(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -418,33 +345,68 @@ _BEAT_TYPE_DESCRIPTIONS = {
     "CLIFFHANGER": "Leave something unresolved — hint at more, make them want to come back",
 }
 
-_BEAT_MIN_TURNS = {
-    "HOOK": 2, "BUILD": 3, "TWIST": 2, "CONSEQUENCE": 2, "CLIFFHANGER": 1,
-}
 
-_BEAT_ADVANCE_SCORE = {
-    "Easy":   {"HOOK": 2.5, "BUILD": 3.0, "TWIST": 3.0, "CONSEQUENCE": 3.0, "CLIFFHANGER": 2.0},
-    "Medium": {"HOOK": 3.0, "BUILD": 3.5, "TWIST": 3.5, "CONSEQUENCE": 3.5, "CLIFFHANGER": 2.5},
-    "Hard":   {"HOOK": 3.5, "BUILD": 4.0, "TWIST": 4.0, "CONSEQUENCE": 4.0, "CLIFFHANGER": 3.0},
-}
-
-
-def generate_beat_fields(user_inputs: dict, scenario: dict, character: dict) -> list:
+def generate_beat_sequence(scenario: dict, character: dict, test_moment_hint: str = "") -> dict:
     """
-    Generate all ScenarioBeat DB fields for a sequence of beats.
-
-    Input keys:
-        num_beats        (B1) — integer 1-5
-        beat_sequence    (B2) — list of BeatType strings e.g. ["HOOK","BUILD","TWIST","CONSEQUENCE","CLIFFHANGER"]
-        test_moment_desc (B3) — optional, description of the TEST moment (maps to TWIST in existing enum)
+    First LLM pass: designs the optimal beat sequence for a scenario.
+    Returns {"num_beats": int, "beat_sequence": [str], "test_moment_desc": str, "reasoning": str}
     """
-    beat_sequence = user_inputs.get("beat_sequence", ["HOOK", "BUILD", "TWIST", "CONSEQUENCE", "CLIFFHANGER"])
-    test_moment  = user_inputs.get("test_moment_desc", "")
-    difficulty   = scenario.get("difficulty", "Medium")
+    hint_line = f"\nCREATOR HINT (twist/test moment to include): {test_moment_hint}" if test_moment_hint.strip() else ""
+
+    user_content = (
+        f"CHARACTER: {character.get('name', '')} | {character.get('archetype', '')} | {character.get('city', '')}\n"
+        f"SCENARIO TITLE: {scenario.get('scenarioTitle', '')}\n"
+        f"OVERALL ARC: {scenario.get('overallArc', '')}\n"
+        f"DIFFICULTY: {scenario.get('difficulty', 'Medium')}\n"
+        f"TONE: {scenario.get('tone', '')}\n"
+        f"ATMOSPHERE: {scenario.get('atmosphere', '')}\n"
+        f"GOOD OUTCOME: {scenario.get('goodOutcome', '')}\n"
+        f"BAD OUTCOME: {scenario.get('badOutcome', '')}"
+        f"{hint_line}"
+    )
+
+    beat_catalog = "\n".join(
+        f"  {bt}: {desc}" for bt, desc in _BEAT_TYPE_DESCRIPTIONS.items()
+    )
+
+    system = f"""You are a narrative architect designing the beat structure for an Indian social roleplay scenario.
+
+Available beat types:
+{beat_catalog}
+
+Your task: choose the OPTIMAL sequence of beats (2–5 beats) that will create the most emotionally resonant arc for this specific scenario. Not every scenario needs all 5 beats. A tight 3-beat sequence can outperform a padded 5-beat one.
+
+Criteria for a good sequence:
+- Matches the scenario's difficulty and emotional tone
+- Each beat serves a distinct narrative purpose — no filler
+- The arc has a clear beginning tension, middle escalation, and unresolved end
+- TWIST and CONSEQUENCE should only appear if the scenario has a genuine reversal moment
+- CLIFFHANGER is almost always the right final beat for a roleplay scenario
+
+Return a single JSON object:
+{{
+  "num_beats": <integer 2-5>,
+  "beat_sequence": ["<BeatType>", ...],
+  "test_moment_desc": "<if a TWIST beat is included: exactly what the character does to test the user at that moment. Empty string if no TWIST.>",
+  "reasoning": "<2-3 sentences: why this sequence fits this specific scenario's arc and difficulty>"
+}}
+
+Output ONLY the JSON object. No preamble, no explanation."""
+
+    result = llm_client.complete(system=system, user=user_content, model="gemini", max_tokens=1024)
+    return _parse_json_response(result)
+
+
+def generate_beat_fields(beat_sequence: list, scenario: dict, character: dict, test_moment_desc: str = "") -> list:
+    """
+    Second LLM pass: generates all ScenarioBeat DB fields for an approved beat sequence.
+    The LLM owns minTurnsInBeat and engagedAdvanceScore — no hardcoded lookup tables.
+    """
+    difficulty = scenario.get("difficulty", "Medium")
 
     beat_descriptions_block = "\n".join(
         f"  Beat {i+1}: {bt} — {_BEAT_TYPE_DESCRIPTIONS.get(bt, bt)}"
-        + (f"\n    TEST/TWIST note from creator: {test_moment}" if bt in ("TWIST", "CONSEQUENCE") and test_moment else "")
+        + (f"\n    TEST/TWIST note: {test_moment_desc}" if bt in ("TWIST", "CONSEQUENCE") and test_moment_desc else "")
         for i, bt in enumerate(beat_sequence)
     )
 
@@ -457,7 +419,7 @@ def generate_beat_fields(user_inputs: dict, scenario: dict, character: dict) -> 
         f"BEAT SEQUENCE:\n{beat_descriptions_block}"
     )
 
-    system_instruction = f"""You are a narrative director writing beat-by-beat emotional direction for a social roleplay conversation.
+    system = f"""You are a narrative director writing beat-by-beat emotional direction for a social roleplay conversation.
 Each beat is a phase of the conversation with specific emotional and behavioral instructions for the AI character.
 
 Generate EXACTLY {len(beat_sequence)} beat objects, one per beat in the sequence above.
@@ -466,38 +428,31 @@ For each beat, output a JSON object with EXACTLY these keys:
 {{
   "beatNumber": <1-based int>,
   "beatType": "<exact BeatType from the sequence>",
-  "narrativeContext": "<2-3 lines: where is the scene emotionally at this beat — what has happened, what the mood is>",
-  "characterEmotionalState": "<how the character is feeling at THIS beat — specific, not generic>",
-  "flowDirective": "<what she does when user IS engaged — specific actions, not emotional adjectives>",
-  "hookDirective": "<what she does when user is NOT engaged — a deliberate punch, observation, or shift>",
-  "minTurnsInBeat": <see below>,
-  "engagedAdvanceScore": <see below>
+  "narrativeContext": "<2-3 lines in 2nd person: where YOU are emotionally at this beat — what has just happened, what the mood is. Start with 'You have...' or 'You are...'. Never use the character name or she/her.>",
+  "characterEmotionalState": "<how YOU are feeling at THIS beat — in 2nd person. Never use she/her.>",
+  "flowDirective": "<what YOU do when user IS engaged — specific actions in imperative 2nd person, e.g. 'Ask...', 'Say...'. Not emotional adjectives.>",
+  "hookDirective": "<what YOU do when user is NOT engaged — a deliberate punch, observation, or shift. Imperative 2nd person.>",
+  "minTurnsInBeat": <integer 1-5 — how many turns the user must spend before this beat can advance. Judge by narrative weight: quick beats (HOOK, CLIFFHANGER) = 1-2; substantial beats (BUILD, TWIST, CONSEQUENCE) = 2-4. Higher = more time for the beat to land.>,
+  "engagedAdvanceScore": <float 2.0-5.0 — engagement score threshold to advance to the next beat. Scale to difficulty ({difficulty}): Easy=2.5-3.5, Medium=3.0-4.0, Hard=3.5-4.5. Set higher for emotionally pivotal beats like TWIST and CONSEQUENCE.>
 }}
 
-minTurnsInBeat values: HOOK=2, BUILD=3, TWIST=2, CONSEQUENCE=2, CLIFFHANGER=1
-engagedAdvanceScore values ({difficulty}): {json.dumps(_BEAT_ADVANCE_SCORE.get(difficulty, _BEAT_ADVANCE_SCORE["Medium"]))}
-
 Rules:
-- narrativeContext: write as if briefing the AI on what just happened and where we stand. Past tense context, present emotional state.
-- flowDirective and hookDirective: write in imperative 2nd person ("Ask...", "Go quiet...", "Say..."). Specific behavior, not "be warm."
-- The emotional arc must progress CONTINUOUSLY from beat 1 to beat {len(beat_sequence)}, following the scenario's overall arc.
+- narrativeContext: 2nd person, "You have just...", "You are now...". NEVER use the character name or she/her.
+- characterEmotionalState: 2nd person — "You are feeling...". NEVER use she/her.
+- flowDirective and hookDirective: imperative 2nd person ("Ask...", "Go quiet...", "Say..."). Specific behavior, not "be warm."
+- minTurnsInBeat and engagedAdvanceScore: reason from the beat's narrative weight and the scenario difficulty — do NOT use generic defaults.
+- The emotional arc must progress CONTINUOUSLY from beat 1 to beat {len(beat_sequence)}.
 
 Output a JSON ARRAY of {len(beat_sequence)} objects. No preamble, no explanation."""
 
-    response = client.models.generate_content(
-        model=GEMINI_TEXT_MODEL,
-        contents=user_content,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            max_output_tokens=8192,
-            response_mime_type="application/json",
-        ),
-    )
-    result = _parse_json_response(response.text)
-    # Normalise — model may return {"beats": [...]} or directly [...]
-    if isinstance(result, dict):
-        result = result.get("beats", list(result.values())[0])
-    return result
+    result = llm_client.complete(system=system, user=user_content, model="gemini", max_tokens=8192)
+    parsed = _parse_json_response(result)
+    if isinstance(parsed, dict):
+        parsed = parsed.get("beats", list(parsed.values())[0])
+    max_turns = len(parsed)
+    for beat in parsed:
+        beat["maxTurnsInBeat"] = max_turns
+    return parsed
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -509,21 +464,22 @@ def generate_video_scene_script(
     character: dict,
     num_segments: int,
     segment_duration: int = SEGMENT_DURATION,
+    user_name: str = "",
 ) -> dict:
     """
     Generate a multi-segment video screenplay that conveys the roleplay intent.
-    The video is a teaser — it shows what the roleplay is about, not the full story.
-
-    Returns:
-      { total_segments, full_dialogue, segments: [ {segment_number, scene_description, shot_description, dialogue, continuation_note} ] }
+    The character introduces herself in segment 1 and speaks directly to the viewer.
     """
     total_video_seconds = num_segments * segment_duration
-    total_words = int(total_video_seconds * 2.5)
+    words_per_segment = int(segment_duration * 2.5)
 
     roleplay_intent = (
         f"{scenario.get('scenarioTitle', '')} — {scenario.get('tagline', '')}. "
         f"{scenario.get('primalHook', '')} Arc: {scenario.get('overallArc', '')}."
     )
+
+    viewer_ref = user_name.strip() if user_name.strip() else "the viewer"
+    viewer_address = f'"{user_name.strip()}"' if user_name.strip() else "the viewer by feel (no name needed)"
 
     user_content = (
         f"CHARACTER\n"
@@ -531,7 +487,8 @@ def generate_video_scene_script(
         f"  Archetype: {character.get('archetype', '')}\n"
         f"  City: {character.get('city', '')}\n"
         f"  Physical vibe / avatarPrompt: {character.get('avatarPrompt', '')}\n"
-        f"  Speaking style: {character.get('speakingStyle', '')}\n\n"
+        f"  Speaking style: {character.get('speakingStyle', '')}\n"
+        f"  Backstory: {character.get('backstory', '')}\n\n"
         f"ROLEPLAY INTENT\n"
         f"  {roleplay_intent}\n\n"
         f"SCENE CONTEXT\n"
@@ -541,15 +498,24 @@ def generate_video_scene_script(
         f"  Tone: {scenario.get('tone', '')}\n\n"
         f"TECHNICAL\n"
         f"  Segments: {num_segments} × {segment_duration}s = {total_video_seconds}s total\n"
-        f"  Dialogue word target: ~{total_words} words across all segments"
+        f"  Dialogue word target: ~{words_per_segment} words per segment"
     )
 
-    system_instruction = f"""You are a creative director and AI video prompt engineer.
+    system = f"""You are a creative director and AI video prompt engineer.
 Write a {total_video_seconds}-second teaser video script ({num_segments} segments × {segment_duration}s each).
 
-PURPOSE: This video is a roleplay teaser — it must convey what this roleplay scenario is about and make the viewer want to experience it. It is NOT a dramatisation of the full story. Think of it as a mood piece: character in her world, hinting at the tension, speaking directly to the viewer about the kind of moment she is in.
+PURPOSE: This video introduces the AI character to a real person who will roleplay with her. The character speaks DIRECTLY to camera — pulling them into her world, making them feel seen, and ending on a hook that makes them want to talk back.
 
-The character speaks directly to camera — in Hinglish — about the feeling, the situation, the stakes. She is not narrating a plot. She is pulling the viewer into her world.
+This is NOT a plot summary. It is the character being alive on screen — her personality, her world, her feelings — all directed at the viewer as if they are already in a conversation.
+
+SEGMENT 1 — INTRODUCTION (mandatory):
+The character must open with a warm, natural Hinglish self-introduction. She says her name, gives a quick glimpse of who she is and her world, and references how she and the viewer are connected (draw from the scenario context). She addresses the viewer as "aap". Keep it conversational and genuine — like the first message from someone who is genuinely excited to meet you. Example style (not to copy): "Hi, main [Name] hun... [something about herself and the connection]..."
+
+SEGMENTS 2 to {num_segments - 1} — CHARACTER'S WORLD:
+Each segment reveals a different facet of the character — her life, her feelings, what she cares about, what makes her laugh or worry. She keeps talking TO the viewer, second-person ("tum", "tumhara", "aapko"). She is not narrating a story — she is sharing herself.
+
+SEGMENT {num_segments} — ENGAGEMENT HOOK (mandatory):
+The final segment must end with an open question or emotional pull that directly invites the viewer to respond. She leans in, holds eye contact, and asks something genuine — something only THIS viewer can answer. Make it feel personal and slightly vulnerable.
 
 Return a single JSON object:
 {{
@@ -560,34 +526,25 @@ Return a single JSON object:
       "segment_number": 1,
       "scene_description": "<environment + lighting only, 1-2 sentences>",
       "shot_description": "<character motion + camera framing only, 1-2 sentences>",
-      "dialogue": "<spoken words for this segment, ~{int(segment_duration * 2.5)} words>",
+      "objects": ["<2-4 concrete visible props that ground the scene, in Hinglish or English>"],
+      "dialogue": "<spoken words for this segment, ~{words_per_segment} words, in Hinglish>",
       "continuation_note": "<visual bridge to next segment>"
     }}
   ]
 }}
 
 Rules:
-- scene_description: ONLY the environment. No character actions.
-- shot_description: ONLY observable physical motion + camera framing.
-- dialogue: 1st person, spoken TO the viewer. Convey the emotional texture and stakes of the roleplay — not the plot. ~{int(segment_duration * 2.5)} words per segment.
-- CAMERA EYE CONTACT: Whenever the character is speaking dialogue, she must look directly into the camera lens — not off to the side, not into the distance. She holds steady eye contact with the camera as if speaking to the person watching. Reflect this in the shot_description for any segment with dialogue (e.g. "she looks directly into the camera lens").
-- Vary camera framing across segments (wide → medium → close-up → pull back).
-- The dialogue arc should move from establishing the vibe → surfacing the tension → leaving the viewer wanting to know what happens next.
-- CRITICAL — NO REAL PEOPLE: Do NOT mention any real celebrity, public figure, actor, politician, athlete, influencer, brand, or trademarked name anywhere in scene_description, shot_description, dialogue, or continuation_note. Use only fictional or generic references (e.g. "a popular song", "a Bollywood-style film" — never a specific artist or title). Veo3 will hard-reject the video if any real person's name or likeness appears in the prompt.
+- scene_description: ONLY the environment and lighting. No character actions.
+- shot_description: ONLY observable physical motion + camera framing. For any segment with dialogue, include "she looks directly into the camera lens" — she must hold steady eye contact as if talking to the person watching.
+- objects: 2–4 specific physical props visible in the frame. Make them evocative and culturally specific — e.g. "chai ki pyali", "khidki se baarish", "purani diary", "phone screen glow". These ground the scene visually and help the video model render a coherent world.
+- dialogue: Hinglish (Hindi in Roman script mixed with English). 1st person. Spoken TO camera. ~{words_per_segment} words. Creative, warm, specific — not generic. Reveal the character through what she says.
+- Vary camera framing across segments: wide → medium → close-up → pull back.
+- CRITICAL — NO REAL PEOPLE: Do NOT mention any real celebrity, public figure, actor, politician, athlete, influencer, brand, or trademarked name anywhere.
 
 Output ONLY the JSON object."""
 
-    response = client.models.generate_content(
-        model=GEMINI_TEXT_MODEL,
-        contents=user_content,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            # max_output_tokens=8192,
-            response_mime_type="application/json",
-        ),
-    )
-    text = response.text.strip()
-    return _parse_json_response(text)
+    result = llm_client.complete(system=system, user=user_content, model="gemini", max_tokens=4096)
+    return _parse_json_response(result.strip())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -603,7 +560,6 @@ def generate_storyline(
     """
     Writer agent — generates a full creative storyline narrative.
     Accepts optional editor_notes from a previous critique loop to guide improvement.
-
     Returns a plain-text narrative string (not JSON).
     """
     beat_block = "\n".join(
@@ -637,7 +593,7 @@ def generate_storyline(
         f"{notes_block}"
     )
 
-    system_instruction = """You are a master storyteller writing a cinematic narrative for a culturally-grounded Indian social roleplay scenario.
+    system = """You are a master storyteller writing a cinematic narrative for a culturally-grounded Indian social roleplay scenario.
 
 Your task: write a complete, immersive storyline that a video director would use to shoot the scenario.
 
@@ -657,15 +613,7 @@ Rules:
 
 Output ONLY the storyline text. No headers, no labels, no JSON."""
 
-    response = client.models.generate_content(
-        model=GEMINI_TEXT_MODEL,
-        contents=user_content,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            # max_output_tokens=2048,
-        ),
-    )
-    return response.text.strip()
+    return llm_client.complete(system=system, user=user_content, model="gemini", max_tokens=2048)
 
 
 def critique_storyline(
@@ -676,9 +624,6 @@ def critique_storyline(
 ) -> dict:
     """
     Editor agent — scores the storyline and returns specific improvement points.
-    Receives full context (character, scenario, beats) to judge against
-    the actual creative intent, not generic story quality standards.
-
     Returns {"score": float, "improvements": [str, ...]}.
     """
     beat_summary = ", ".join(
@@ -695,7 +640,7 @@ def critique_storyline(
         f"STORYLINE TO CRITIQUE:\n{storyline}"
     )
 
-    system_instruction = """You are a senior creative editor for a culturally-specific Indian social roleplay app.
+    system = """You are a senior creative editor for a culturally-specific Indian social roleplay app.
 
 Your job is to score this storyline and identify ONLY the specific, concrete things that need improvement.
 
@@ -716,17 +661,73 @@ Return ONLY a JSON object:
 {"score": <float 0-10>, "improvements": ["Specific issue 1", "Specific issue 2"]}
 If score >= 6.5, improvements can be empty."""
 
-    response = claude_client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=1024,
-        system=system_instruction,
-        messages=[{"role": "user", "content": user_content}],
-    )
     try:
-        result = _parse_json_response(response.content[0].text)
+        result = llm_client.complete(system=system, user=user_content, model="claude", max_tokens=1024)
+        parsed = _parse_json_response(result)
         return {
-            "score": float(result.get("score", 7.0)),
-            "improvements": result.get("improvements", []),
+            "score": float(parsed.get("score", 7.0)),
+            "improvements": parsed.get("improvements", []),
         }
     except Exception:
         return {"score": 7.0, "improvements": []}
+
+
+
+def generate_audio_script(segments: list, character: dict) -> str:
+    """
+    Synthesize a polished, continuous voiceover script from screenplay segments.
+    Returns plain text ready for ElevenLabs TTS.
+    """
+    
+    dialogues = []
+    for i, seg in enumerate(segments, 1):
+        d = seg.get("dialogue", "").strip()
+        if d:
+            dialogues.append(f"[Segment {i}] {d}")
+
+    combined_dialogue = "\n".join(dialogues)
+    voice_style = character.get("voicePrompt", "") or character.get("voice_prompt", "")
+    speaking_style = character.get("speakingStyle", "") or character.get("speaking_style", "")
+
+    system = f"""You are a voice director preparing Indian short-form dialogue for ElevenLabs TTS.
+
+Your task: take plain dialogue and enrich it with ElevenLabs expression tags that match the emotional subtext of each line — so the voice sounds alive, not flat.
+
+VALID EXPRESSION TAGS (use ONLY these, exactly as written):
+EXPRESSION TAGS FORMAT:
+- Use square brackets with descriptive emotional/delivery directions
+- Examples: [sighs], [nervous], [whispers], [laughing], [voice breaking], 
+  [softly], [with disbelief], [picking up pace], [trailing off]
+- Be descriptive — [with a tired laugh] works better than just [laughs]
+- Tags are voice-dependent: keep them natural, not theatrical
+
+HOW TO PLACE TAGS:
+- Insert immediately before the word/phrase they emotionally color
+- Example: "Main [sighs] kabhi driver banne ka socha hi nahi tha..."
+- Example: "[nervous] Log kya sochenge, mera parivaar..."
+- Use 1 tag per emotional beat — don't stack multiple tags
+- Not every sentence needs a tag — silence is also expression
+
+WHEN TO USE WHICH TAG:
+- [sighs] → resignation, wistfulness, exhaling a hard truth
+- [laughs] / [chuckles] → self-deprecating humor, nervous lightness
+- [nervous] → vulnerability, second-guessing, fear of judgment  
+- [whispers] → intimate confession, something just between you two
+- [gasps] → realization, surprise landing mid-sentence
+- [excited] → a spark of hope breaking through the doubt
+
+PACING:
+- Keep all existing commas, ellipses (...), em dashes — they're intentional
+- Do NOT rewrite or paraphrase any line
+- Preserve Hinglish exactly as written
+
+Output ONLY the enriched script — no labels, no explanation."""
+
+    user = (
+        f"CHARACTER VOICE STYLE: {voice_style}\n"
+        f"SPEAKING STYLE: {speaking_style}\n\n"
+        f"SCREENPLAY DIALOGUE:\n{combined_dialogue}\n\n"
+        "Write the continuous voiceover script:"
+    )
+
+    return llm_client.complete(system=system, user=user, model="claude", max_tokens=1024).strip()

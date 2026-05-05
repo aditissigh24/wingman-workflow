@@ -155,6 +155,7 @@ async def _save_beats_async(beats: list, scenario_id: str, character_id: str) ->
                     "hookDirective": beat.get("hookDirective", ""),
                     "minTurnsInBeat": int(beat.get("minTurnsInBeat", 2)),
                     "engagedAdvanceScore": float(beat.get("engagedAdvanceScore", 3.0)),
+                    "maxTurnsInBeat": int(beat.get("maxTurnsInBeat", len(beats))),
                 }
             )
         logger.info("Saved %d beats for scenario %s", len(beats), scenario_id)

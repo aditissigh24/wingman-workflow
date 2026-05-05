@@ -4,7 +4,7 @@ from typing import Callable, Optional
 from utils.polling import PipelineError
 from steps.prompt_enhancer import enhance_image_prompt, write_video_script, enhance_audio_prompt
 from steps.image_generator import generate_image
-from steps.video_generator import generate_video
+from steps.video_dispatcher import generate_video_segment as generate_video
 from steps.audio_generator import generate_audio
 from steps.lip_sync import lip_sync
 

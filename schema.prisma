@@ -442,6 +442,11 @@ model ScenarioBeat {
   // If user score is below this, they stay in the beat with hookDirective firing.
   // If score is at or above this AND minTurnsInBeat is met, advance to next beat.
 
+  maxTurnsInBeat          Int       @default(5)
+  // Total number of beats in this scenario.
+  // Denormalized here so the runtime can check beatNumber == maxTurnsInBeat
+  // without a separate scenario query to detect the final beat.
+
   isActive                Boolean   @default(true)
   createdAt               DateTime  @default(now())
   updatedAt               DateTime  @updatedAt

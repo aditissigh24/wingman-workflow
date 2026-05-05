@@ -124,9 +124,9 @@ def run_test(image_path: str, duration: int, keep: bool) -> bool:
     log.info("Submitting generation request (duration=%ds)…", duration)
 
     try:
-        from steps.veo3_generator import generate_video_segment
+        from steps.seedance_generator import generate_video_segment
     except ImportError as e:
-        log.error("Cannot import veo3_generator: %s", e)
+        log.error("Cannot import seedance_generator: %s", e)
         return False
 
     progress_log: list[tuple[int, str]] = []

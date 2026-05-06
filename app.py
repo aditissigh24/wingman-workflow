@@ -1,9 +1,29 @@
 import logging
 import math
+import subprocess
+import sys
 import time
 import traceback
 
 import streamlit as st
+
+
+@st.cache_resource
+def _ensure_prisma_client():
+    """Run prisma generate once on startup (required on Streamlit Community Cloud)."""
+    result = subprocess.run(
+        [sys.executable, "-m", "prisma", "generate"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logging.getLogger("prisma_setup").warning(
+            "prisma generate exited %d: %s", result.returncode, result.stderr
+        )
+    return result.returncode
+
+
+_ensure_prisma_client()
 
 logging.basicConfig(
     level=logging.INFO,

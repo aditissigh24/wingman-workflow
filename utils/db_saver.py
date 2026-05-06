@@ -30,7 +30,7 @@ def _trunc(value, max_len: int) -> str:
 
 
 async def _save_character_async(data: dict) -> str:
-    from prisma import Prisma
+    from prisma_client import Prisma
     db = Prisma()
     await db.connect()
     try:
@@ -85,7 +85,7 @@ async def _save_character_async(data: dict) -> str:
 
 
 async def _save_scenario_async(data: dict, character_id: str) -> str:
-    from prisma import Prisma
+    from prisma_client import Prisma
     db = Prisma()
     logger.info("save_scenario: connecting to DB...")
     await db.connect()
@@ -132,7 +132,7 @@ async def _save_scenario_async(data: dict, character_id: str) -> str:
 
 
 async def _save_beats_async(beats: list, scenario_id: str, character_id: str) -> None:
-    from prisma import Prisma
+    from prisma_client import Prisma
     db = Prisma()
     logger.info("save_beats: connecting to DB, %d beats to save...", len(beats))
     await db.connect()

@@ -16,9 +16,9 @@ TEST_SCEN_ID = "test_scen1"
 
 async def main():
     try:
-        from prisma import Prisma
+        from prisma_client import Prisma
     except ImportError:
-        print("[FAIL] prisma package not installed. Run:  pip install prisma")
+        print("[FAIL] prisma client not generated. Run:  prisma generate")
         sys.exit(1)
 
     db = Prisma()

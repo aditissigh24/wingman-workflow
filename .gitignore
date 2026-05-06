@@ -34,6 +34,9 @@ ENV/
 # Output / generated media
 output/
 
+# Prisma generated Python client (regenerated at startup on Streamlit Cloud)
+prisma_client/
+
 # Logs
 *.log
 logs/

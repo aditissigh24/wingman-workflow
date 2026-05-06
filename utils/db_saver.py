@@ -12,14 +12,14 @@ logger = logging.getLogger("db_saver")
 def _run_async(coro):
     """Run an async coroutine synchronously (for use in Streamlit)."""
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        return loop.run_until_complete(coro)
+        asyncio.get_running_loop()
+        # A loop is already running (e.g. Jupyter/async context) — offload to a thread
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result()
     except RuntimeError:
+        # No running loop — safe to call asyncio.run directly
         return asyncio.run(coro)
 
 

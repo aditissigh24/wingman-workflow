@@ -11,15 +11,27 @@ import streamlit as st
 @st.cache_resource
 def _ensure_prisma_client():
     """Run prisma generate once on startup (required on Streamlit Community Cloud)."""
+    import os
+
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    schema_path = os.path.join(project_root, "schema.prisma")
+
     result = subprocess.run(
-        [sys.executable, "-m", "prisma", "generate"],
+        [sys.executable, "-m", "prisma", "generate", "--schema", schema_path],
         capture_output=True,
         text=True,
+        cwd=project_root,
     )
     if result.returncode != 0:
         logging.getLogger("prisma_setup").warning(
-            "prisma generate exited %d: %s", result.returncode, result.stderr
+            "prisma generate exited %d:\nstdout: %s\nstderr: %s",
+            result.returncode, result.stdout, result.stderr,
         )
+
+    # Ensure the project root is in sys.path so prisma_client can be imported
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
     return result.returncode
 
 

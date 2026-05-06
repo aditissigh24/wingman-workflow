@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TEST_CHAR_ID = "test_dbchk"  # <= 10 chars, VarChar(10)
+TEST_SCEN_ID = "test_scen1"
 
 
 async def main():
@@ -32,9 +33,8 @@ async def main():
         sys.exit(1)
 
     try:
+        # --- Character test ---
         print(f"\nUpserting dummy Character (id={TEST_CHAR_ID})...")
-        # NOTE: voiceAudioUrl and imageUrl are excluded because those columns
-        # may not exist yet in the DB if migrations haven't been fully applied.
         record = await db.character.upsert(
             where={"id": TEST_CHAR_ID},
             data={
@@ -66,8 +66,51 @@ async def main():
         print(f"     gender   = {record.gender}")
         print(f"     city     = {record.city}")
         print(f"     createdAt= {record.createdAt}")
+
+        # --- ScenarioBeat test (exercises maxTurnsInBeat) ---
+        print(f"\nUpserting dummy Scenario (id={TEST_SCEN_ID})...")
+        await db.scenario.upsert(
+            where={"id": TEST_SCEN_ID},
+            data={
+                "create": {
+                    "id": TEST_SCEN_ID,
+                    "characterId": TEST_CHAR_ID,
+                    "scenarioTitle": "Test Scenario",
+                },
+                "update": {"scenarioTitle": "Test Scenario"},
+            },
+        )
+        print("[OK] Scenario saved.")
+
+        print("Creating dummy ScenarioBeat with maxTurnsInBeat...")
+        await db.scenariobeat.delete_many(where={"scenarioId": TEST_SCEN_ID})
+        beat = await db.scenariobeat.create(data={
+            "scenarioId": TEST_SCEN_ID,
+            "characterId": TEST_CHAR_ID,
+            "beatNumber": 1,
+            "beatType": "HOOK",
+            "narrativeContext": "Test narrative context.",
+            "characterEmotionalState": "Curious and warm.",
+            "flowDirective": "Let the conversation breathe.",
+            "hookDirective": "Say something unexpectedly observant.",
+            "minTurnsInBeat": 2,
+            "engagedAdvanceScore": 3.5,
+            "maxTurnsInBeat": 5,
+        })
+        print(f"[OK] ScenarioBeat saved!")
+        print(f"     id              = {beat.id}")
+        print(f"     beatType        = {beat.beatType}")
+        print(f"     minTurnsInBeat  = {beat.minTurnsInBeat}")
+        print(f"     maxTurnsInBeat  = {beat.maxTurnsInBeat}")
+        print(f"     engagedAdvScore = {beat.engagedAdvanceScore}")
+
+        print(f"\n[INFO] Records left in DB for manual verification:")
+        print(f"       Character  id = {TEST_CHAR_ID}")
+        print(f"       Scenario   id = {TEST_SCEN_ID}")
+        print(f"       ScenarioBeat id = {beat.id}")
+
     except Exception as e:
-        print(f"[FAIL] Could not save Character: {e}")
+        print(f"[FAIL] Test failed: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
@@ -75,7 +118,7 @@ async def main():
         await db.disconnect()
         print("\nDisconnected.")
 
-    print("\n✓ DB test passed — Prisma can read/write to the database.")
+    print("\n[PASS] DB test passed - Prisma can read/write to the database.")
 
 
 if __name__ == "__main__":

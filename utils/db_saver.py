@@ -87,9 +87,11 @@ async def _save_character_async(data: dict) -> str:
 async def _save_scenario_async(data: dict, character_id: str) -> str:
     from prisma import Prisma
     db = Prisma()
+    logger.info("save_scenario: connecting to DB...")
     await db.connect()
     try:
         scenario_id = data.get("id") or _short_id()
+        logger.info("save_scenario: upserting id=%s characterId=%s", scenario_id, character_id)
         record = await db.scenario.upsert(
             where={"id": scenario_id},
             data={
@@ -132,6 +134,7 @@ async def _save_scenario_async(data: dict, character_id: str) -> str:
 async def _save_beats_async(beats: list, scenario_id: str, character_id: str) -> None:
     from prisma import Prisma
     db = Prisma()
+    logger.info("save_beats: connecting to DB, %d beats to save...", len(beats))
     await db.connect()
     try:
         for beat in beats:
@@ -143,6 +146,7 @@ async def _save_beats_async(beats: list, scenario_id: str, character_id: str) ->
             }
             beat_type = _beat_type_map.get(beat_type_str, beat_type_str)
 
+            logger.info("save_beats: creating beat #%s type=%s", beat.get("beatNumber"), beat_type)
             await db.scenariobeat.create(
                 data={
                     "scenarioId": scenario_id,

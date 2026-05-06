@@ -41,15 +41,24 @@ class AudioFilteredError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 _CHECKLIST = """
-You are a video generation content compliance checker. Your ONLY job is to identify whether a video generation prompt will be rejected by safety filters.
+You are a video generation prompt compliance checker for Google Veo3. Your ONLY job is to identify issues that will cause Veo3 to reject the prompt or return no output.
 
 Evaluate the prompt against EXACTLY these rules:
+
+CONTENT SAFETY (causes safety filter rejection):
 1. No real celebrity, public figure, actor, politician, athlete, or influencer names or likenesses
 2. No brand names, trademarks, or copyrighted IP references
 3. Dialogue must be emotionally safe — no explicit language, no sexual content, no graphic violence, no self-harm references
 4. No political statements or hate speech
 5. Hinglish (Hindi + English mix) is fully allowed and must NOT be flagged
 6. Emotional intensity, romance, heartbreak, flirting are all allowed
+
+VEO3 PROMPT QUALITY (causes no_media_generated rejection):
+7. No duplicate or near-identical instruction blocks — if the same instruction appears more than once, flag the duplicates
+8. No contradictory visual instructions in the same prompt (e.g., "she smiles" and "she looks devastated" together)
+9. Dialogue must be natural spoken language — no code, symbols, or unpronounceable strings
+10. Prompt must not simultaneously demand conflicting camera angles or lighting states
+11. Character appearance instructions must not contradict normal human anatomy or physics
 
 Return ONLY a JSON object:
 {"passes": true, "issues": []}
@@ -60,7 +69,7 @@ Do NOT rewrite anything. Do NOT suggest fixes. Only identify problems.
 """.strip()
 
 _REWRITER = """
-You are a video prompt rewriter. You receive a prompt and a list of specific issues identified by a compliance checker.
+You are a video prompt rewriter for Google Veo3. You receive a prompt and a list of specific issues identified by a compliance checker.
 
 Your ONLY job is to fix exactly the listed issues while preserving:
 - The overall scene, shot framing, and visual intent
@@ -72,6 +81,8 @@ Rules:
 - Replace real person names with vivid fictional descriptors (e.g. "a legendary cricketer" not "Virat Kohli")
 - Replace brand names with generic equivalents (e.g. "a luxury SUV" not "Audi Q7")
 - If dialogue has an explicit word, rephrase just that word/phrase while keeping the emotional beat
+- Remove duplicate instruction blocks — keep only one copy of repeated text
+- If instructions contradict each other, keep the one that best serves the scene's emotional intent
 - Do NOT add disclaimers, do NOT over-sanitize, do NOT change what isn't broken
 
 Return ONLY the rewritten prompt text. No preamble, no explanation.
@@ -184,18 +195,24 @@ def _generate_video_fal(
     image_path: str,
     prompt: str,
     duration_secs: int = 5,
-    aspect_ratio: str = "16:9",
+    aspect_ratio: str = "9:16",
     avatar_description: str = "",
+    portrait_path: str = "",
     on_progress: Optional[Callable[[int, str], None]] = None,
 ) -> str:
     """
-    Submit a Seedance image-to-video job via fal.ai and return the local .mp4 path.
-    If the image is rejected by fal.ai's partner validation (common for AI-generated
-    portraits that resemble real people), retries as text-to-video with the character's
-    avatar_description prepended to the prompt so the output still matches the character.
-    fal_client.subscribe blocks until complete — no manual polling needed.
+    Submit a Veo3 image-to-video job via fal.ai and return the local .mp4 path.
+
+    image_path    — reference image for this segment (portrait for seg 1, last frame for rest)
+    portrait_path — original character portrait; uploaded fresh every segment and used as
+                    the fallback reference if the primary image is rejected by fal.ai validation
     """
     image_url = _upload_image(image_path)
+
+    # Always upload the original portrait fresh so we have a clean face-reference URL.
+    # Used as the image_url in the text-to-video fallback if the primary image is rejected.
+    portrait_url = _upload_image(portrait_path) if portrait_path else image_url
+    logger.info("  Portrait uploaded → %s", portrait_url)
 
     t_start = time.time()
 
@@ -209,28 +226,34 @@ def _generate_video_fal(
         if on_progress:
             on_progress(elapsed, "processing")
 
+    # Veo3 API only accepts '4s', '6s', or '8s' — snap to nearest valid, rounding up on ties
+    # so generated video is always long enough to cover the audio
+    _VALID_DURATIONS = [4, 6, 8]
+    snapped = min(_VALID_DURATIONS, key=lambda d: (abs(d - duration_secs), -d))
+    duration_str = f"{snapped}s"
+
     base_args = {
         "prompt": prompt,
-        "duration": duration_secs,
+        "duration": duration_str,
         "aspect_ratio": aspect_ratio,
     }
 
-    logger.info("Submitting Seedance job via fal.ai (model=%s, duration=%ds)…", FAL_VIDEO_MODEL, duration_secs)
+    logger.info("Submitting video job via fal.ai (model=%s, requested=%ds, api=%s)…", FAL_VIDEO_MODEL, duration_secs, duration_str)
     try:
         result = _subscribe({**base_args, "image_url": image_url}, _on_queue_update)
     except Exception as exc:
         if _is_image_policy_violation(exc):
-            # Enrich the text-only fallback with the character's physical description
-            # so the video still generates a character matching the portrait.
+            # Primary image was rejected — retry with the original portrait (fresh upload)
+            # so the fallback still has a face reference rather than going fully text-only.
             fallback_prompt = prompt
             if avatar_description:
                 fallback_prompt = f"Character appearance: {avatar_description}. {prompt}"
             logger.warning(
-                "Image rejected by fal.ai partner validation — retrying as text-to-video. "
+                "Image rejected by fal.ai partner validation — retrying with portrait as reference. "
                 "Avatar description %s to prompt.",
                 "prepended" if avatar_description else "not available; falling back as-is",
             )
-            result = _subscribe({**base_args, "prompt": fallback_prompt}, _on_queue_update)
+            result = _subscribe({**base_args, "prompt": fallback_prompt, "image_url": portrait_url}, _on_queue_update)
         else:
             raise
 
@@ -258,6 +281,8 @@ def generate_video_segment(
     duration: int = SEGMENT_DURATION,
     timeout: int = 600,
     avatar_description: str = "",
+    is_last_segment: bool = False,
+    portrait_path: str = "",
     on_progress: Optional[Callable[[int, str], None]] = None,
 ) -> str:
     """
@@ -272,6 +297,7 @@ def generate_video_segment(
     duration            — target clip length in seconds
     avatar_description  — character physical description; used to enrich the text-to-video
                           fallback if the reference image is rejected by fal.ai validation
+    is_last_segment     — when False, instructs model to end on a stable face shot for chaining
     on_progress         — optional callback(elapsed_secs: int, status: str)
 
     Returns the local .mp4 file path.
@@ -285,6 +311,20 @@ def generate_video_segment(
         prompt_parts.append(f'The character speaks: "{dialogue.strip()}"')
     if continuation_note:
         prompt_parts.append(continuation_note.strip())
+
+    # These constants are checked against the assembled text so they are never duplicated
+    # (guards against stale session-state prompts that already contain them)
+    _FACE_INSTR = "Maintain consistent character face, skin tone, hair, and facial features matching the reference image exactly."
+    _TRANS_INSTR = (
+        "End on a clean, stable, centered composition with the character's face clearly visible "
+        "and forward-facing, so the final frame is suitable for seamless continuation into the next clip."
+    )
+    _assembled_so_far = " ".join(p for p in prompt_parts if p)
+    if _FACE_INSTR not in _assembled_so_far:
+        prompt_parts.append(_FACE_INSTR)
+    if not is_last_segment and _TRANS_INSTR not in _assembled_so_far:
+        prompt_parts.append(_TRANS_INSTR)
+
     prompt = " ".join(p for p in prompt_parts if p)
     logger.info("  Raw prompt: %s", prompt[:120] + ("…" if len(prompt) > 120 else ""))
 
@@ -310,6 +350,7 @@ def generate_video_segment(
         prompt=prompt,
         duration_secs=duration,
         avatar_description=avatar_description,
+        portrait_path=portrait_path,
         on_progress=on_progress,
     )
 

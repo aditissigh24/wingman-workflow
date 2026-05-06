@@ -445,7 +445,7 @@ Rules:
 
 Output a JSON ARRAY of {len(beat_sequence)} objects. No preamble, no explanation."""
 
-    result = llm_client.complete(system=system, user=user_content, model="gemini", max_tokens=8192)
+    result = llm_client.complete(system=system, user=user_content, model="claude", max_tokens=8192)
     parsed = _parse_json_response(result)
     if isinstance(parsed, dict):
         parsed = parsed.get("beats", list(parsed.values())[0])

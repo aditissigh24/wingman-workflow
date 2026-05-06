@@ -21,6 +21,8 @@ def generate_video_segment(
     duration: int = SEGMENT_DURATION,
     timeout: int = 600,
     avatar_description: str = "",
+    is_last_segment: bool = False,
+    portrait_path: str = "",
     on_progress: Optional[Callable[[int, str], None]] = None,
     **_,
 ) -> str:
@@ -38,5 +40,7 @@ def generate_video_segment(
         duration=duration,
         timeout=timeout,
         avatar_description=avatar_description,
+        is_last_segment=is_last_segment,
+        portrait_path=portrait_path,
         on_progress=on_progress,
     )

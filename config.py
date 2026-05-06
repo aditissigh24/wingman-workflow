@@ -23,7 +23,7 @@ FAL_ELEVENLABS_MODEL = os.environ.get("FAL_ELEVENLABS_MODEL", "fal-ai/elevenlabs
 FAL_LIPSYNC_MODEL    = os.environ.get("FAL_LIPSYNC_MODEL",    "fal-ai/heygen/v3/lipsync/precision")
 
 # OpenRouter model IDs for LLM text calls
-OR_CLAUDE_MODEL = os.environ.get("OR_CLAUDE_MODEL", "anthropic/claude-sonnet-4-5")
+OR_CLAUDE_MODEL = os.environ.get("OR_CLAUDE_MODEL", "anthropic/claude-sonnet-4-6")
 OR_GEMINI_MODEL = os.environ.get("OR_GEMINI_MODEL", "google/gemini-2.5-flash")
 
 # City → ElevenLabs accent hint mapping (used in TTS voice direction)

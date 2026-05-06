@@ -63,3 +63,12 @@ def generate_audio_fal(text: str, voice_id: str = ELEVENLABS_VOICE_ID) -> str:
     content_type = audio.get("content_type", "audio/mpeg") if isinstance(audio, dict) else "audio/mpeg"
     ext = "mp3" if "mp3" in content_type or "mpeg" in content_type else "wav"
     return _download_audio(audio_url, ext=ext)
+
+
+def get_audio_duration(audio_path: str) -> float:
+    """Return duration of an audio file in seconds using mutagen."""
+    from mutagen import File as MutagenFile
+    f = MutagenFile(audio_path)
+    if f and f.info:
+        return float(f.info.length)
+    raise RuntimeError(f"Could not determine audio duration for: {audio_path}")

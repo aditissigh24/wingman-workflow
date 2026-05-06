@@ -1,4 +1,5 @@
 import logging
+import math
 import time
 import traceback
 
@@ -11,7 +12,7 @@ logging.basicConfig(
 
 from config import validate_keys, CITY_ACCENT_MAP, ELEVENLABS_VOICE_ID
 from steps.audio_generator import generate_audio, list_voices
-from steps.elevenlabs_generator import generate_audio_fal
+from steps.elevenlabs_generator import generate_audio_fal, get_audio_duration
 from steps.image_generator import generate_image, generate_images
 from steps.lipsync_heygen import lipsync_heygen
 from steps.media_merger import concatenate_segments
@@ -65,6 +66,7 @@ _DEFAULTS: dict = {
     "s8_script_prompt": "",       # editable screenplay prompt context
     "s8b_audio_script": "",       # LLM-generated voiceover script text
     "s8c_audio_path": "",         # ElevenLabs TTS audio file path
+    "s8c_audio_duration": 0.0,    # measured audio duration in seconds
     "s9_segment_paths": [],       # list of .mp4 paths
     "s9_segment_prompts": {},     # dict {segment_number: editable_prompt}
     "s10_combined_path": "",      # concatenated video
@@ -136,7 +138,7 @@ def _clear_from(n: int):
     # Sub-step clearing: 8b+8c depend on 8; 10b depends on 8c and 10
     if n <= 8:
         for k in ["s8b_status", "s8b_audio_script", "s8c_status", "s8c_audio_path",
-                  "s10b_status", "s10b_final_path"]:
+                  "s8c_audio_duration", "s10b_status", "s10b_final_path"]:
             st.session_state[k] = _DEFAULTS[k]
     elif n <= 10:
         for k in ["s10b_status", "s10b_final_path"]:
@@ -365,7 +367,7 @@ st.subheader("⚙️ Pipeline")
 char_inputs     = st.session_state["char_inputs"]
 scenario_inputs = st.session_state["scenario_inputs"]
 beat_inputs     = st.session_state["beat_inputs"]
-seg_dur         = 8   # fixed: 5 segments × 8 s = 40 s
+seg_dur         = 6   # 6-second clips (Veo3 API snaps to 6s); total count derived from audio duration
 voice_id        = st.session_state["selected_voice_id"]
 
 
@@ -1062,7 +1064,7 @@ else:
             ch = st.session_state["s1_char_fields"]
             with st.spinner("Writing roleplay teaser screenplay…"):
                 try:
-                    script = generate_video_scene_script(sc, ch, num_segments=5, segment_duration=8, user_name=st.session_state.get("viewer_name", ""))
+                    script = generate_video_scene_script(sc, ch, num_segments=5, segment_duration=6, user_name=st.session_state.get("viewer_name", ""))
                     st.session_state["s8_script"] = script
                     st.session_state["s8_status"] = "done"
                 except Exception as e:
@@ -1089,11 +1091,11 @@ if st.session_state["s8b_status"] == "done":
     )
     if edited_script != st.session_state["s8b_audio_script"]:
         st.session_state["s8b_audio_script"] = edited_script
-        for k in ["s8c_status", "s8c_audio_path", "s10b_status", "s10b_final_path"]:
+        for k in ["s8c_status", "s8c_audio_path", "s8c_audio_duration", "s10b_status", "s10b_final_path"]:
             st.session_state[k] = _DEFAULTS[k]
     if st.button("Regenerate Voice-Over Script", key="regen_s8b"):
         for k in ["s8b_status", "s8b_audio_script", "s8c_status", "s8c_audio_path",
-                  "s10b_status", "s10b_final_path"]:
+                  "s8c_audio_duration", "s10b_status", "s10b_final_path"]:
             st.session_state[k] = _DEFAULTS[k]
         st.rerun()
 
@@ -1130,8 +1132,12 @@ _s8b_done = st.session_state["s8b_status"] == "done"
 
 if st.session_state["s8c_status"] == "done":
     st.audio(st.session_state["s8c_audio_path"])
+    _dur = st.session_state.get("s8c_audio_duration", 0.0)
+    if _dur > 0:
+        _n_segs = max(math.ceil(_dur / seg_dur), 1)
+        st.caption(f"Audio duration: {_dur:.1f}s → {_n_segs} video segment(s) of {seg_dur}s each")
     if st.button("Regenerate Audio", key="regen_s8c"):
-        for k in ["s8c_status", "s8c_audio_path", "s10b_status", "s10b_final_path"]:
+        for k in ["s8c_status", "s8c_audio_path", "s8c_audio_duration", "s10b_status", "s10b_final_path"]:
             st.session_state[k] = _DEFAULTS[k]
         st.rerun()
 
@@ -1186,7 +1192,9 @@ else:
             with st.spinner("Generating audio via ElevenLabs…"):
                 try:
                     audio_path = generate_audio_fal(script_text, voice_id)
+                    audio_duration = get_audio_duration(audio_path)
                     st.session_state["s8c_audio_path"] = audio_path
+                    st.session_state["s8c_audio_duration"] = audio_duration
                     st.session_state["s8c_status"] = "done"
                 except Exception as e:
                     st.session_state["s8c_status"] = "error"
@@ -1204,7 +1212,7 @@ step_header(9, "Generate Video Segments (Veo3)")
 _s8_done = st.session_state["s8_status"] == "done"
 
 
-def _build_segment_prompt(seg: dict) -> str:
+def _build_segment_prompt(seg: dict, is_last: bool = False) -> str:
     """Build the Seedance prompt for a single segment."""
     parts = []
     objs = seg.get("objects", [])
@@ -1226,18 +1234,34 @@ def _build_segment_prompt(seg: dict) -> str:
 def _run_step9():
     script      = st.session_state["s8_script"]
     segments    = script["segments"]
-    total       = script["total_segments"]
     done_so_far = st.session_state["s9_segment_paths"]
     resume_from = len(done_so_far)
     seg_prompts = st.session_state.get("s9_segment_prompts", {})
     avatar_desc = (st.session_state.get("s1_char_fields") or {}).get("avatarPrompt", "")
 
-    current_ref   = st.session_state["s2_image_path"] if resume_from == 0 else extract_last_frame(done_so_far[-1])
+    # Derive total segment count from actual audio duration (5s per clip)
+    audio_duration = st.session_state.get("s8c_audio_duration", 0.0)
+    if audio_duration > 0:
+        total = max(math.ceil(audio_duration / seg_dur), 1)
+    else:
+        total = script["total_segments"]
+
+    portrait_path = st.session_state["s2_image_path"]  # original character portrait — uploaded fresh each segment
+    current_ref   = portrait_path if resume_from == 0 else extract_last_frame(done_so_far[-1])
     segment_paths = list(done_so_far)
 
     try:
-        for i, seg in enumerate(segments[resume_from:], start=resume_from):
-            n    = seg["segment_number"]
+        for i in range(resume_from, total):
+            n       = i + 1
+            is_last = (n == total)
+
+            # Use screenplay segment; if audio needs more segments than screenplay has,
+            # reuse the last scene without dialogue (pure visual continuation)
+            if i < len(segments):
+                seg = segments[i]
+            else:
+                seg = {**segments[-1], "dialogue": ""}
+
             cont = seg.get("continuation_note", "") if n > 1 else ""
 
             # Use user-edited prompt if available, else build default
@@ -1273,6 +1297,8 @@ def _run_step9():
                     continuation_note="",
                     duration=seg_dur,
                     avatar_description=avatar_desc,
+                    is_last_segment=is_last,
+                    portrait_path=portrait_path,
                     on_progress=_make_cb(status_text, n, total, seg_start),
                 )
             else:
@@ -1285,6 +1311,8 @@ def _run_step9():
                     continuation_note=cont,
                     duration=seg_dur,
                     avatar_description=avatar_desc,
+                    is_last_segment=is_last,
+                    portrait_path=portrait_path,
                     on_progress=_make_cb(status_text, n, total, seg_start),
                 )
 
@@ -1294,7 +1322,7 @@ def _run_step9():
             status_text.success(f"Segment {n}/{total} done in {seg_elapsed}s")
             _show_video(video_path, label=f"▶ Segment {n}/{total}")
 
-            if n < total:
+            if not is_last:
                 current_ref = extract_last_frame(video_path)
                 cooldown = 10
                 status_text.info(f"Cooling down {cooldown}s before segment {n+1}…")
@@ -1342,7 +1370,7 @@ else:
             st.caption("Review and edit per-segment Veo3 prompts before generating. Leave blank to use auto-built prompts.")
             for seg in segments:
                 sn = seg["segment_number"]
-                default_p = _build_segment_prompt(seg)
+                default_p = _build_segment_prompt(seg, is_last=(sn == len(segments)))
                 edited = st.text_area(
                     f"Segment {sn} prompt",
                     value=seg_prompts.get(str(sn), default_p),
